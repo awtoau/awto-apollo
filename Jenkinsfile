@@ -1,0 +1,118 @@
+import org.jenkinsci.plugins.workflow.steps.FlowInterruptedException
+
+pipeline {
+    options {
+        skipDefaultCheckout true
+    }
+    agent any
+    stages {
+        stage('Build Docker Image') {
+            steps {
+                sh 'docker build -t cynthion-test https://github.com/greatscottgadgets/cynthion-test.git'
+            }
+        }
+        stage('Checkout as submodule') {
+            steps {
+                dir('cynthion-test') {
+                    git url: 'https://github.com/greatscottgadgets/cynthion-test.git', branch: 'main'
+                    sh 'make submodule-checkout'
+                    sh 'rm -rf dependencies/apollo'
+                    dir('dependencies/apollo') {
+                        checkout scm // override pinned submodule version with current version
+                    }
+                }
+            }
+        }
+        stage('Build') {
+            agent{
+                docker {
+                    image 'cynthion-test'
+                    reuseNode true
+                    args '--name cynthion-test_container'
+                }
+            }
+            steps {
+                dir('cynthion-test') {
+                    sh 'cp /tmp/calibration.dat calibration.dat'
+                }
+                dir('cynthion-test/dependencies/apollo/firmware') {
+                    sh 'make APOLLO_BOARD=cynthion BOARD_REVISION_MAJOR=1 BOARD_REVISION_MINOR=4 get-deps dfu'
+                }
+            }
+        }
+        stage('HIL Test') {
+            agent {
+                docker {
+                    image 'cynthion-test'
+                    reuseNode true
+                    args '''
+                            --name cynthion-test_container
+                            --group-add=20
+                            --group-add=46
+                            --device-cgroup-rule="c 166:* rmw"
+                            --device-cgroup-rule="c 189:* rmw"
+                            --device /dev/bus/usb
+                            --volume /run/udev/control:/run/udev/control
+                            --net=host
+                            -v /tmp/req_pipe:/tmp/req_pipe
+                            -v /tmp/res_pipe:/tmp/res_pipe
+                        '''
+                }
+            }
+            steps {
+                dir('cynthion-test') {
+                    script {
+                        allOff()
+                    }
+                    script {
+                        reset('cyntest_tycho cyntest_greatfet cyntest_bmp')
+                    }
+                    script {
+                        runCommand(3, 5, 'MINUTES', "HIL Test", 'make unattended')
+                    }
+                }
+            }
+        }
+    }
+    post {
+        always {
+            cleanWs(cleanWhenNotBuilt: false,
+                    deleteDirs: true,
+                    disableDeferredWipeout: true,
+                    notFailBuild: true)
+        }
+    }
+}
+
+def allOff() {
+    // Allow 20 seconds for the USB hub port power server to respond
+    runCommand(3, 20, 'SECONDS', 'USB hub port power server command', "hubs all off")
+}
+
+def reset(devices) {
+    // Allow 20 seconds for the USB hub port power server to respond
+    runCommand(3, 20, 'SECONDS', 'USB hub port power server command', "hubs ${devices} reset")
+}
+
+def runCommand(retries, time, unit, title, cmd) {
+    retry(retries) {
+        try {
+            timeout(time: time, unit: unit) {
+                sh "${cmd}"
+            }
+        } catch (FlowInterruptedException err) {
+            // Check if the cause was specifically an exceeded timeout
+            def cause = err.getCauses().get(0)
+            if (cause instanceof org.jenkinsci.plugins.workflow.steps.TimeoutStepExecution.ExceededTimeout) {
+                echo "${title} timeout reached."
+                throw err // Re-throw the exception to fail the build
+            } else {
+                echo "Build interrupted for another reason."
+                throw err // Re-throw the exception to fail the build
+            }
+        } catch (Exception err) {
+            echo "An unrelated error occurred: ${err.getMessage()}"
+            throw err
+        }
+    }
+}
