@@ -3,6 +3,11 @@ import org.jenkinsci.plugins.workflow.steps.FlowInterruptedException
 pipeline {
     options {
         skipDefaultCheckout true
+        throttleJobProperty(
+            categories: ['cynthion-named-container'],
+            throttleEnabled: true,
+            throttleOption: 'category',
+        )
     }
     agent any
     stages {
@@ -34,9 +39,7 @@ pipeline {
             steps {
                 dir('cynthion-test') {
                     sh 'cp /tmp/calibration.dat calibration.dat'
-                }
-                dir('cynthion-test/dependencies/apollo/firmware') {
-                    sh 'make APOLLO_BOARD=cynthion BOARD_REVISION_MAJOR=1 BOARD_REVISION_MINOR=4 get-deps dfu'
+                    sh 'make firmware'
                 }
             }
         }
@@ -63,11 +66,7 @@ pipeline {
                 dir('cynthion-test') {
                     script {
                         allOff()
-                    }
-                    script {
                         reset('cyntest_tycho cyntest_greatfet cyntest_bmp')
-                    }
-                    script {
                         runCommand(3, 5, 'MINUTES', "HIL Test", 'make unattended')
                     }
                 }
@@ -85,12 +84,12 @@ pipeline {
 }
 
 def allOff() {
-    // Allow 20 seconds for the USB hub port power server to respond
+    // Allow up to 3 retries, 20 seconds each, for the USB hub port power server to respond
     runCommand(3, 20, 'SECONDS', 'USB hub port power server command', "hubs all off")
 }
 
 def reset(devices) {
-    // Allow 20 seconds for the USB hub port power server to respond
+    // Allow up to 3 retries, 20 seconds each, for the USB hub port power server to respond
     runCommand(3, 20, 'SECONDS', 'USB hub port power server command', "hubs ${devices} reset")
 }
 
