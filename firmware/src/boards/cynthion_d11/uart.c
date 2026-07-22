@@ -16,6 +16,8 @@
 
 #include <peripheral_clk_config.h>
 
+#include "apollo_mode.h"
+
 
 // Hide the ugly Atmel Sercom object name.
 typedef Sercom sercom_t;
@@ -48,6 +50,17 @@ static void _uart_configure_pinmux(bool use_for_uart)
  */
 void uart_configure_pinmux(void)
 {
+	// Hard guard: never steal the shared pins (PA11/PA14) for UART while JTAG
+	// owns them. This is the last line of defense below the console CDC callbacks
+	// (see console.c and apollo_mode.h) — a half-programmed FPGA is the failure
+	// we are preventing, so JTAG programming must be uninterruptible. The UART
+	// restore on JTAG exit is safe: jtag_deinit() clears the lock (via
+	// apollo_mode_release_jtag()) *before* calling jtag_platform_deinit(), so by
+	// the time that restore reaches here the lock is already released.
+	if (apollo_mode_jtag_active()) {
+		return;
+	}
+
 	_uart_configure_pinmux(true);
 	uart_active = true;
 }

@@ -17,6 +17,7 @@
 
 #include "led.h"
 #include "jtag.h"
+#include "apollo_mode.h"
 
 void jtag_state_ack(bool tms);
 
@@ -145,6 +146,15 @@ __attribute__((weak)) void jtag_platform_deinit(void)
  */
 void jtag_init(void)
 {
+	// Take exclusive ownership of the shared JTAG/UART pins before we touch any
+	// pinmux. While this lock is held, the UART console cannot repinmux the pins
+	// out from under an in-flight JTAG program/configure sequence (see
+	// apollo_mode.h and awtoau/cynthion-workspace#65). A well-behaved host issues
+	// exactly one JTAG_START per session, so a failed acquire means the previous
+	// session was never stopped; we proceed regardless (JTAG already owns the
+	// pins) rather than refuse and leave a half-set-up chain.
+	apollo_mode_acquire_jtag();
+
 	gpio_set_pin_level(TCK_GPIO, false);
 
 	// Set up each of our JTAG pins.
@@ -173,6 +183,12 @@ void jtag_deinit(void)
 		gpio_set_pin_direction(gpio_pins[i], GPIO_DIRECTION_IN);
 		gpio_set_pin_pull_mode(gpio_pins[i], GPIO_PULL_OFF);
 	}
+
+	// JTAG session over: release the lock BEFORE platform deinit, because
+	// jtag_platform_deinit() restores the UART pinmux via uart_configure_pinmux(),
+	// which is itself guarded against JTAG mode. Releasing first lets that
+	// legitimate restore through; from here a CDC event may re-init the UART too.
+	apollo_mode_release_jtag();
 
 	jtag_platform_deinit();
 }

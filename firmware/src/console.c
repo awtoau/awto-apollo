@@ -11,6 +11,7 @@
 
 #include "led.h"
 #include "uart.h"
+#include "apollo_mode.h"
 
 
 extern bool uart_active;
@@ -61,16 +62,27 @@ void console_task(void)
  */
 void tud_cdc_line_coding_cb(uint8_t itf, cdc_line_coding_t const* coding)
 {
+	// Refuse to (re)initialize the UART while JTAG owns the shared pins. On d11
+	// the console UART lives on the JTAG pins (PA11/PA14), so a host line-coding
+	// change arriving mid-flash would otherwise repinmux them and corrupt an
+	// in-flight JTAG program/configure. See apollo_mode.h / #65.
+	if (apollo_mode_jtag_active()) {
+		return;
+	}
 	uart_initialize(true, coding->bit_rate);
 }
 
 
 /**
  * Other callbacks: if our UART isn't active, initialize it.
+ * These are also gated on JTAG mode for the same pin-ownership reason.
  */
 
 void tud_cdc_rx_wanted_cb(uint8_t itf, char wanted_char)
 {
+	if (apollo_mode_jtag_active()) {
+		return;
+	}
 	if (!uart_active) {
 		uart_initialize(true, 115200);
 	}
@@ -78,6 +90,9 @@ void tud_cdc_rx_wanted_cb(uint8_t itf, char wanted_char)
 
 void tud_cdc_line_state_cb(uint8_t itf, bool dtr, bool rts)
 {
+	if (apollo_mode_jtag_active()) {
+		return;
+	}
 	if (!uart_active) {
 		uart_initialize(true, 115200);
 	}
