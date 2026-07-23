@@ -84,7 +84,7 @@ enum {
 };
 
 // Microsoft OS 1.0 Compat ID Feature descriptor
-uint8_t msft_10_compat_id[] = {
+const uint8_t msft_10_compat_id[] = {
 	// Header: length, bcdVersion, wIndex, bCount, reserved[7]
 	U32_TO_U8S_LE(0x0028),
 	U16_TO_U8S_LE(0x0100),
@@ -101,7 +101,7 @@ uint8_t msft_10_compat_id[] = {
 };
 
 // Microsoft OS 1.0 Extended Properties Feature descriptor
-uint8_t msft_10_ext_props[] = {
+const uint8_t msft_10_ext_props[] = {
 	U32_TO_U8S_LE(0x0000008E),  // Length 142 bytes
 	U16_TO_U8S_LE(0x0100),      // Version
 	U16_TO_U8S_LE(0x0005),      // Extended Properties Feature Descriptor index
@@ -131,9 +131,9 @@ uint8_t msft_10_ext_props[] = {
 bool handle_get_ms_descriptor(uint8_t rhport, tusb_control_request_t const* request)
 {
 	if (request->wIndex == 0x0004) {
-		return tud_control_xfer(rhport, request, msft_10_compat_id, sizeof(msft_10_compat_id));
+		return tud_control_xfer(rhport, request, (void *)msft_10_compat_id, sizeof(msft_10_compat_id));
 	} else if (request->wIndex == 0x0005) {
-		return tud_control_xfer(rhport, request, msft_10_ext_props, sizeof(msft_10_ext_props));
+		return tud_control_xfer(rhport, request, (void *)msft_10_ext_props, sizeof(msft_10_ext_props));
 	} else {
 		return false;
 	}
