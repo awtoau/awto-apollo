@@ -14,7 +14,14 @@
 
 extern uint8_t jtag_out_buffer[256];
 
-bool fpga_online = false;
+/*
+ * Written from USB interrupt context (the vendor request handlers, e.g. the
+ * ISC_ENABLE/DISABLE path in jtag.c) and read from the main loop (led_task()).
+ * volatile forces every access through memory so the reader cannot observe a
+ * stale cached value; sufficient here because this is a single-writer,
+ * single-reader flag with no read-modify-write.
+ */
+volatile bool fpga_online = false;
 
 /*
  * ECP5 opcode that enables offline configuration mode

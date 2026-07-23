@@ -10,7 +10,7 @@
 #ifndef __FPGA_H__
 #define __FPGA_H__
 
-extern bool fpga_online;
+extern volatile bool fpga_online;
 
 /**
  * Sets up the I/O pins needed to configure the FPGA.

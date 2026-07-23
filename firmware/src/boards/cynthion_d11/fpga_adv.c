@@ -85,8 +85,16 @@ void fpga_adv_task(void)
 	if (board_millis() - last_update < WINDOW_PERIOD_MS) return;
 
 	// Update edge counts inside time window.
+	//
+	// Mask the EIC interrupt across the read/clear pair: EIC_Handler increments
+	// edge_counter on every advertisement edge, so an interrupt landing between
+	// the two statements would have its edge silently dropped. That under-counts
+	// the window, feeding fpga_requesting_port() (threshold > 2) and potentially
+	// missing an FPGA USB-takeover request.
+	NVIC_DisableIRQ(EIC_IRQn);
 	window_edges = edge_counter;
 	edge_counter = 0;
+	NVIC_EnableIRQ(EIC_IRQn);
 	last_update  = board_millis();
 
     // Take over USB if the FPGA is not requesting the port.
