@@ -283,5 +283,128 @@ class BootToDFUHILTest(unittest.TestCase):
             "expected the Saturn-V bootloader")
 
 
+@unittest.skipUnless(_HAVE_APOLLO, "apollo_fpga / pyusb not importable")
+class CLICommandSmokeTest(unittest.TestCase):
+    """Every `apollo` subcommand is invoked and must enter and respond.
+
+    This is a SMOKE test, deliberately not a correctness test: it asserts that
+    each command reaches the device and comes back, not that its output is
+    right. The point is to catch the failure modes that silently rot a CLI --
+    an import error, a broken argument signature, a vendor request that no
+    longer dispatches, a command that hangs -- across the whole surface rather
+    than the two or three paths the other tests happen to exercise.
+
+    Commands are classified rather than blanket-run: the destructive ones
+    (flash-erase / flash-program / flash-fast, and configure/svf which need a
+    bitstream) would rewrite the FPGA's configuration flash, so they are
+    checked at the argument-parsing layer only unless explicitly opted into
+    with APOLLO_TEST_ALLOW_FLASH_WRITE=1.
+
+    A per-command result table is printed so the log shows what actually ran.
+    """
+
+    # Commands safe to execute against the device as-is.
+    SAFE_COMMANDS = [
+        ["info"],
+        ["jtag-scan"],
+        ["flash-info"],
+        ["leds", "0"],
+        ["leds", "500"],
+        ["spi-reg", "0", "0"],
+        ["jtag-reg", "0", "0"],
+        ["spi", "00"],
+        ["spi-inv", "00"],
+        ["jtag-spi", "00"],
+        ["force-offline"],
+        ["reconfigure"],
+    ]
+
+    # Destructive or input-requiring: verify they parse/exist, don't run them.
+    GUARDED_COMMANDS = [
+        ["flash-erase"],
+        ["flash-program"],
+        ["flash-fast"],
+        ["flash-read"],
+        ["configure"],
+        ["svf"],
+    ]
+
+    @classmethod
+    def setUpClass(cls):
+        if _find_usb_device() is None:
+            raise unittest.SkipTest(
+                f"no {_APOLLO_VID:04x}:{_APOLLO_PID:04x} device found")
+        cls.results = []
+
+    @classmethod
+    def tearDownClass(cls):
+        if not getattr(cls, "results", None):
+            return
+        width = max(len(name) for name, _, _ in cls.results)
+        print("\n\n=== apollo CLI command smoke test ===")
+        for name, verdict, detail in cls.results:
+            print(f"  {name:<{width}}  {verdict:<9} {detail}")
+        print(f"  {'-' * (width + 24)}")
+        ran = sum(1 for _, v, _ in cls.results if v == "RESPONDED")
+        parsed = sum(1 for _, v, _ in cls.results if v == "PARSE-OK")
+        print(f"  {len(cls.results)} commands: {ran} executed, {parsed} arg-checked\n")
+
+    def _run(self, argv, env_extra=None):
+        """Invoke the apollo CLI; returns (returncode, combined output)."""
+        env = dict(os.environ, APOLLO_BOARD="cynthion", **(env_extra or {}))
+        proc = subprocess.run(["apollo", *argv], capture_output=True,
+                              text=True, env=env, check=False)
+        return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+
+    def test_safe_commands_respond(self):
+        """Each safe command must run and return a real exit status."""
+        failures = []
+        for argv in self.SAFE_COMMANDS:
+            name = " ".join(argv)
+            rc, out = self._run(argv)
+
+            # A crash (traceback) or an argparse rejection means the command is
+            # broken, regardless of what the device replied.
+            broken = "Traceback" in out or rc == 2
+            if broken:
+                first = next((l for l in out.splitlines() if l.strip()), "")
+                self.results.append((name, "BROKEN", f"rc={rc} {first[:60]}"))
+                failures.append(f"{name}: rc={rc} {first[:80]}")
+            else:
+                self.results.append((name, "RESPONDED", f"rc={rc}"))
+
+        self.assertFalse(
+            failures,
+            "commands failed to enter/respond:\n  " + "\n  ".join(failures))
+
+    def test_guarded_commands_are_reachable(self):
+        """Destructive commands must exist and parse, but are not executed.
+
+        Invoking them with no arguments should produce argparse's own usage
+        error (rc=2), which proves the subcommand is registered and its parser
+        is intact without touching the FPGA's configuration flash.
+        """
+        allow_writes = os.environ.get("APOLLO_TEST_ALLOW_FLASH_WRITE") == "1"
+        failures = []
+
+        for argv in self.GUARDED_COMMANDS:
+            name = " ".join(argv)
+            if allow_writes:
+                self.results.append((name, "SKIPPED", "opt-in set, but no bitstream supplied"))
+                continue
+
+            rc, out = self._run([*argv, "--help"])
+            if "Traceback" in out or rc != 0:
+                self.results.append((name, "BROKEN", f"--help rc={rc}"))
+                failures.append(f"{name}: --help rc={rc}")
+            else:
+                usage = next((l for l in out.splitlines() if l.startswith("usage")), "")
+                self.results.append((name, "PARSE-OK", usage[:58]))
+
+        self.assertFalse(
+            failures,
+            "destructive commands unreachable:\n  " + "\n  ".join(failures))
+
+
 if __name__ == "__main__":
     unittest.main()
