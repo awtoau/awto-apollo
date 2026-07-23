@@ -29,9 +29,16 @@ typedef enum {
 	// Default mode: UART console may own the shared pins; JTAG is idle.
 	MODE_APOLLO_HOLD = 0,
 
-	// Exclusive JTAG programming/configure mode. While active, the shared pins
-	// belong to JTAG and no non-JTAG consumer may repinmux them.
+	// A JTAG session is open and owns the shared pins, but no programming
+	// sequence has started yet (e.g. a plain jtag-scan). The pins are locked,
+	// but the control plane is otherwise unrestricted.
 	MODE_JTAG_PROGRAM = 1,
+
+	// A JTAG programming/configure sequence is in flight. In addition to the
+	// pin lock, conflicting control-plane requests are refused so the sequence
+	// cannot be interrupted. Entered by escalation from MODE_JTAG_PROGRAM on
+	// the first programming request; left only by ending the JTAG session.
+	MODE_JTAG_PROGRAMMING = 2,
 } apollo_mode_t;
 
 /**
@@ -52,11 +59,28 @@ bool apollo_mode_acquire_jtag(void);
 void apollo_mode_release_jtag(void);
 
 /**
- * @return true iff JTAG currently owns the shared pins. Non-JTAG pin consumers
- *         (uart_initialize(), the console CDC callbacks) must check this and
- *         refuse to repinmux while it is true.
+ * @return true iff JTAG currently owns the shared pins (in either JTAG state).
+ *         Non-JTAG pin consumers (uart_initialize(), the console CDC callbacks)
+ *         must check this and refuse to repinmux while it is true.
  */
 bool apollo_mode_jtag_active(void);
+
+/**
+ * Escalate an open JTAG session to MODE_JTAG_PROGRAMMING, marking a
+ * programming/configure sequence as in flight. Called when the first
+ * programming-class vendor request arrives.
+ *
+ * No-op if a JTAG session is not open (nothing to escalate) or if already
+ * escalated.
+ */
+void apollo_mode_enter_programming(void);
+
+/**
+ * @return true iff a JTAG programming sequence is in flight. The vendor-request
+ *         dispatcher uses this to refuse conflicting control-plane requests, so
+ *         programming cannot be interrupted.
+ */
+bool apollo_mode_programming_active(void);
 
 /**
  * @return the current control-plane mode.

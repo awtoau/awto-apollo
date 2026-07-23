@@ -116,6 +116,75 @@ static void test_release_idempotent(void)
 }
 
 
+/* Escalation to programming requires an open JTAG session. */
+static void test_programming_requires_open_session(void)
+{
+	printf("test_programming_requires_open_session\n");
+	apollo_mode_release_jtag();
+
+	/* No session open: escalation must NOT grant the lock by side effect. */
+	apollo_mode_enter_programming();
+	CHECK(apollo_mode_current() == MODE_APOLLO_HOLD,   "escalation from HOLD is a no-op");
+	CHECK(apollo_mode_jtag_active() == false,          "escalation from HOLD does not lock pins");
+	CHECK(apollo_mode_programming_active() == false,   "not programming after no-op escalation");
+}
+
+
+/* Escalating an open session enters PROGRAMMING and keeps the pin lock. */
+static void test_escalation_enters_programming(void)
+{
+	printf("test_escalation_enters_programming\n");
+	apollo_mode_release_jtag();
+	apollo_mode_acquire_jtag();
+
+	CHECK(apollo_mode_programming_active() == false, "JTAG_START alone is not programming");
+
+	apollo_mode_enter_programming();
+	CHECK(apollo_mode_current() == MODE_JTAG_PROGRAMMING, "escalated to MODE_JTAG_PROGRAMMING");
+	CHECK(apollo_mode_programming_active() == true,       "programming reported active");
+	/* The critical invariant: escalating must NOT drop the pin lock. */
+	CHECK(apollo_mode_jtag_active() == true,              "pins STILL locked while programming");
+
+	apollo_mode_release_jtag();
+}
+
+
+/* Escalation is idempotent, and re-acquire is still refused while programming. */
+static void test_programming_is_sticky(void)
+{
+	printf("test_programming_is_sticky\n");
+	apollo_mode_release_jtag();
+	apollo_mode_acquire_jtag();
+	apollo_mode_enter_programming();
+
+	apollo_mode_enter_programming();  /* second escalation must not regress */
+	CHECK(apollo_mode_current() == MODE_JTAG_PROGRAMMING, "double escalation stays PROGRAMMING");
+	CHECK(apollo_mode_acquire_jtag() == false,            "re-acquire refused while programming");
+	CHECK(apollo_mode_jtag_active() == true,              "still locked after refused acquire");
+
+	apollo_mode_release_jtag();
+}
+
+
+/* Releasing from PROGRAMMING returns all the way to HOLD. */
+static void test_release_from_programming(void)
+{
+	printf("test_release_from_programming\n");
+	apollo_mode_acquire_jtag();
+	apollo_mode_enter_programming();
+
+	apollo_mode_release_jtag();
+	CHECK(apollo_mode_current() == MODE_APOLLO_HOLD,  "PROGRAMMING -> HOLD on release");
+	CHECK(apollo_mode_jtag_active() == false,         "pins freed after release");
+	CHECK(apollo_mode_programming_active() == false,  "programming cleared after release");
+
+	/* And the next session starts un-escalated. */
+	CHECK(apollo_mode_acquire_jtag() == true,         "fresh session acquires after programming");
+	CHECK(apollo_mode_programming_active() == false,  "fresh session starts un-escalated");
+	apollo_mode_release_jtag();
+}
+
+
 int main(void)
 {
 	printf("== apollo_mode lock unit tests ==\n");
@@ -126,6 +195,10 @@ int main(void)
 	test_release_returns_to_hold();
 	test_reacquire_after_release();
 	test_release_idempotent();
+	test_programming_requires_open_session();
+	test_escalation_enters_programming();
+	test_programming_is_sticky();
+	test_release_from_programming();
 
 	printf("\n%d checks, %d failures\n", checks, failures);
 	if (failures == 0) {

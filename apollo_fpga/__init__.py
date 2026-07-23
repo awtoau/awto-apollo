@@ -70,6 +70,7 @@ class ApolloDebugger:
     REQUEST_RECONFIGURE             = 0xc0
     REQUEST_FORCE_FPGA_OFFLINE      = 0xc1
     REQUEST_ALLOW_FPGA_TAKEOVER_USB = 0xc2
+    REQUEST_EMERGENCY_RESET         = 0xec
     REQUEST_BOOT_TO_DFU             = 0xed
 
     LED_PATTERN_IDLE = 500
@@ -392,6 +393,16 @@ class ApolloDebugger:
     def allow_fpga_takeover_usb(self):
         """ Request Apollo to allow FPGA takeover of the USB port. Useful after reconfiguration. """
         self.out_request(self.REQUEST_ALLOW_FPGA_TAKEOVER_USB)
+
+    def emergency_reset(self):
+        """ Cancel any active JTAG session and return Apollo to its idle state.
+
+        This is the only way to preempt an in-flight JTAG programming sequence:
+        it releases the JTAG pin lock and clears the USB takeover policy. Use it
+        to recover a wedged programming session.
+        """
+        self.out_request(self.REQUEST_EMERGENCY_RESET)
+
 
     def boot_to_dfu(self):
         """ Reboot Apollo into the Saturn-V DFU bootloader.

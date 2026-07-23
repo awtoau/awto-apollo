@@ -17,6 +17,7 @@
 #include "led.h"
 #include "jtag.h"
 #include "fpga.h"
+#include "apollo_mode.h"
 //#include "selftest.h"
 #include "debug_spi.h"
 #include "usb_switch.h"
@@ -70,6 +71,11 @@ enum {
 	// Self-test requests.
 	//
 	VENDOR_REQUEST_GET_RAIL_VOLTAGE        = 0xe0,
+
+	//
+	// Control-plane escape hatch.
+	//
+	VENDOR_REQUEST_EMERGENCY_RESET         = 0xec,
 
 	//
 	// Microsoft WCID descriptor request
@@ -247,10 +253,130 @@ bool handle_boot_to_dfu_finish(uint8_t rhport, tusb_control_request_t const* req
 
 
 /**
+ * Requests belonging to the JTAG family; always permitted during a JTAG
+ * session, since they are what the session exists to issue.
+ */
+static bool is_jtag_request(uint8_t request)
+{
+	switch (request) {
+		case VENDOR_REQUEST_JTAG_START:
+		case VENDOR_REQUEST_JTAG_STOP:
+		case VENDOR_REQUEST_JTAG_CLEAR_OUT_BUFFER:
+		case VENDOR_REQUEST_JTAG_SET_OUT_BUFFER:
+		case VENDOR_REQUEST_JTAG_GET_IN_BUFFER:
+		case VENDOR_REQUEST_JTAG_SCAN:
+		case VENDOR_REQUEST_JTAG_RUN_CLOCK:
+		case VENDOR_REQUEST_JTAG_GOTO_STATE:
+		case VENDOR_REQUEST_JTAG_GET_STATE:
+		case VENDOR_REQUEST_JTAG_BULK_SCAN:
+			return true;
+		default:
+			return false;
+	}
+}
+
+
+/**
+ * JTAG requests that actually drive the scan chain. The first of these in a
+ * session escalates it to "programming in flight", after which conflicting
+ * control-plane requests are refused.
+ */
+static bool is_jtag_programming_request(uint8_t request)
+{
+	switch (request) {
+		case VENDOR_REQUEST_JTAG_SET_OUT_BUFFER:
+		case VENDOR_REQUEST_JTAG_SCAN:
+		case VENDOR_REQUEST_JTAG_RUN_CLOCK:
+		case VENDOR_REQUEST_JTAG_GOTO_STATE:
+		case VENDOR_REQUEST_JTAG_BULK_SCAN:
+			return true;
+		default:
+			return false;
+	}
+}
+
+
+/**
+ * Purely informational requests; safe at any time because they neither touch
+ * the shared pins nor change control-plane state.
+ */
+static bool is_read_only_request(uint8_t request)
+{
+	switch (request) {
+		case VENDOR_REQUEST_GET_ID:
+		case VENDOR_REQUEST_GET_FIRMWARE_VERSION:
+		case VENDOR_REQUEST_GET_USB_API_VERSION:
+		case VENDOR_REQUEST_GET_ADC_READING:
+		case VENDOR_REQUEST_GET_MS_DESCRIPTOR:
+			return true;
+		default:
+			return false;
+	}
+}
+
+
+/**
+ * Policy for what may run while a JTAG programming sequence is in flight.
+ *
+ * Everything else -- reconfiguration, force-offline, USB takeover, debug SPI --
+ * is refused, so programming cannot be interrupted. The escape hatches
+ * (emergency reset, boot-to-DFU) stay permitted precisely because a wedged
+ * programming session is when they are needed most.
+ */
+static bool is_allowed_during_jtag_programming(uint8_t request)
+{
+	if (is_jtag_request(request) || is_read_only_request(request)) {
+		return true;
+	}
+
+	switch (request) {
+		case VENDOR_REQUEST_EMERGENCY_RESET:
+		case VENDOR_REQUEST_BOOT_TO_DFU:
+		case VENDOR_REQUEST_SET_LED_PATTERN:
+			return true;
+		default:
+			return false;
+	}
+}
+
+
+/**
+ * Emergency reset: the only legal preemption path for an active JTAG session.
+ *
+ * Cancels JTAG ownership (releasing the pin lock via jtag_deinit()), drops the
+ * USB takeover policy, and returns the control plane to HOLD.
+ */
+bool handle_emergency_reset(uint8_t rhport, tusb_control_request_t const* request)
+{
+	if (apollo_mode_jtag_active()) {
+		led_set_pattern(LED_IDLE);
+		jtag_deinit();
+	}
+
+	allow_fpga_takeover_usb(false);
+	return tud_control_xfer(rhport, request, NULL, 0);
+}
+
+
+/**
  * Primary vendor request handler.
  */
 static bool handle_vendor_request_setup(uint8_t rhport, tusb_control_request_t const* request)
 {
+	// While a JTAG programming sequence is in flight, refuse anything that
+	// could disturb it. Stalling the request is how the host learns it was
+	// rejected rather than silently ignored.
+	if (apollo_mode_programming_active()
+			&& !is_allowed_during_jtag_programming(request->bRequest)) {
+		return false;
+	}
+
+	// The first programming-class request in an open session escalates it, so
+	// the gate above applies for the remainder of the session.
+	if (is_jtag_programming_request(request->bRequest)) {
+		apollo_mode_enter_programming();
+	}
+
 	switch(request->bRequest) {
 		case VENDOR_REQUEST_GET_ADC_READING:
 			return handle_get_adc_reading_request(rhport, request);
@@ -288,6 +414,9 @@ static bool handle_vendor_request_setup(uint8_t rhport, tusb_control_request_t c
 			return handle_jtag_stop(rhport, request);
 		case VENDOR_REQUEST_JTAG_GET_STATE:
 			return handle_jtag_get_state(rhport, request);
+
+		case VENDOR_REQUEST_EMERGENCY_RESET:
+			return handle_emergency_reset(rhport, request);
 
 		// LED control requests.
 		case VENDOR_REQUEST_SET_LED_PATTERN:
