@@ -54,6 +54,7 @@ enum {
 	VENDOR_REQUEST_TRIGGER_RECONFIGURATION = 0xc0,
 	VENDOR_REQUEST_FORCE_FPGA_OFFLINE      = 0xc1,
 	VENDOR_REQUEST_ALLOW_FPGA_TAKEOVER_USB = 0xc2,
+	VENDOR_REQUEST_BOOT_TO_DFU             = 0xed,
 
 
 	//
@@ -221,6 +222,29 @@ bool handle_allow_fpga_takeover_usb_finish(uint8_t rhport, tusb_control_request_
 }
 
 
+/**
+ * Request that Apollo reboot into the Saturn-V DFU bootloader.
+ *
+ * The reboot itself is deferred to the ACK stage (see the _finish handler
+ * below): tud_dfu_runtime_reboot_to_dfu_cb() arms the watchdog and hangs
+ * deliberately, so it never returns. Doing that here would reset the device
+ * before the host received its status stage, making every successful request
+ * look like a USB failure. Acknowledging first gives the host a clean
+ * completion, and only then do we go down.
+ */
+bool handle_boot_to_dfu(uint8_t rhport, tusb_control_request_t const* request)
+{
+	return tud_control_xfer(rhport, request, NULL, 0);
+}
+
+bool handle_boot_to_dfu_finish(uint8_t rhport, tusb_control_request_t const* request)
+{
+	// Does not return: arms the WDT and spins until the reset lands.
+	tud_dfu_runtime_reboot_to_dfu_cb();
+	return true;
+}
+
+
 
 /**
  * Primary vendor request handler.
@@ -242,6 +266,8 @@ static bool handle_vendor_request_setup(uint8_t rhport, tusb_control_request_t c
 			return handle_force_fpga_offline(rhport, request);
 		case VENDOR_REQUEST_ALLOW_FPGA_TAKEOVER_USB:
 			return handle_allow_fpga_takeover_usb(rhport, request);
+		case VENDOR_REQUEST_BOOT_TO_DFU:
+			return handle_boot_to_dfu(rhport, request);
 
 		// JTAG requests
 		case VENDOR_REQUEST_JTAG_CLEAR_OUT_BUFFER:
@@ -323,6 +349,8 @@ static bool handle_vendor_request_finish(uint8_t rhport, tusb_control_request_t 
 	switch (request->bRequest) {
 		case VENDOR_REQUEST_ALLOW_FPGA_TAKEOVER_USB:
 			return handle_allow_fpga_takeover_usb_finish(rhport, request);
+		case VENDOR_REQUEST_BOOT_TO_DFU:
+			return handle_boot_to_dfu_finish(rhport, request);
 		default:
 			return true;
 	}

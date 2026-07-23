@@ -70,6 +70,7 @@ class ApolloDebugger:
     REQUEST_RECONFIGURE             = 0xc0
     REQUEST_FORCE_FPGA_OFFLINE      = 0xc1
     REQUEST_ALLOW_FPGA_TAKEOVER_USB = 0xc2
+    REQUEST_BOOT_TO_DFU             = 0xed
 
     LED_PATTERN_IDLE = 500
     LED_PATTERN_UPLOAD = 50
@@ -391,6 +392,22 @@ class ApolloDebugger:
     def allow_fpga_takeover_usb(self):
         """ Request Apollo to allow FPGA takeover of the USB port. Useful after reconfiguration. """
         self.out_request(self.REQUEST_ALLOW_FPGA_TAKEOVER_USB)
+
+    def boot_to_dfu(self):
+        """ Reboot Apollo into the Saturn-V DFU bootloader.
+
+        The device acknowledges the request and then immediately resets, so it
+        disappears from the bus and re-enumerates as the bootloader (1d50:615c,
+        "Cynthion Bootloader"). Any USB error raised as the device drops is
+        expected and is swallowed here; callers should re-enumerate rather than
+        continue using this ApolloDebugger instance.
+        """
+        try:
+            self.out_request(self.REQUEST_BOOT_TO_DFU)
+        except usb.core.USBError:
+            # The reset can race the status stage on some hosts; the device is
+            # on its way to the bootloader either way.
+            pass
 
     def close(self):
         """ Closes the USB device so it can be reused, possibly by another ApolloDebugger """
