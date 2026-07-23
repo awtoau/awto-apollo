@@ -68,11 +68,15 @@
 //------------- CLASS -------------//
 #define CFG_TUD_CDC              1
 #define CFG_TUD_DFU_RUNTIME      1
-#define CFG_TUD_VENDOR           1
 
-// CDC FIFO size of TX and RX
-#define CFG_TUD_VENDOR_RX_BUFSIZE   16
-#define CFG_TUD_VENDOR_TX_BUFSIZE   512
+// The TinyUSB vendor *class driver* is not used. Apollo's vendor requests are
+// control transfers serviced by tud_vendor_control_xfer_cb(), which is part of
+// the device stack rather than this class driver -- there is no vendor
+// interface in our configuration descriptor and none of the tud_vendor_*()
+// bulk API is called. Enabling it cost 520 B of flash and 680 B of SRAM (a
+// 512-byte TX FIFO plus overhead) for a driver that never ran, which is not
+// affordable on the SAMD11D14's 16 KB/4 KB budget.
+#define CFG_TUD_VENDOR           0
 
 
 // CDC FIFO size of TX and RX
