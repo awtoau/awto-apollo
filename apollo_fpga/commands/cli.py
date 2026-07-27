@@ -178,6 +178,72 @@ def program_flash(device, args):
 
 
 
+#
+# The udev rules Apollo needs on Linux. Kept here (rather than only in a
+# packaged file) so `apollo install-udev` works from any checkout.
+#
+# 1209:000f is the SPI flash bridge used by `flash --fast`: the bridge gateware
+# takes over the shared USB port and enumerates as its own device, so it needs
+# a rule of its own. Without it the bridge is read-only to non-root users and
+# flash-fast fails with "Access denied (insufficient permissions)".
+#
+UDEV_RULES_PATH = "/etc/udev/rules.d/54-cynthion.rules"
+
+UDEV_RULES = """\
+# Allows access to Cynthion hardware for anyone logged into the physical terminal.
+# Installed by `apollo install-udev`.
+
+SUBSYSTEM=="usb", ATTR{idVendor}=="1d50", ATTR{idProduct}=="615b", SYMLINK+="cynthion-%k", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="1d50", ATTR{idProduct}=="615c", SYMLINK+="cynthion-apollo-%k", TAG+="uaccess"
+
+SUBSYSTEM=="usb", ATTR{idVendor}=="1209", ATTR{idProduct}=="000a", SYMLINK+="cynthion-test-%k", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="1209", ATTR{idProduct}=="000e", SYMLINK+="cynthion-example-%k", TAG+="uaccess"
+
+# Apollo's SPI flash bridge (`apollo flash --fast`).
+SUBSYSTEM=="usb", ATTR{idVendor}=="1209", ATTR{idProduct}=="000f", SYMLINK+="cynthion-flashbridge-%k", TAG+="uaccess"
+"""
+
+
+def install_udev_rules(device, args):
+    """ Install the udev rules Apollo needs, and reload them.
+
+    Runs without touching the device -- it is a host configuration step, and is
+    the fix for `flash --fast` failing with "Access denied" because the flash
+    bridge (1209:000f) had no rule of its own.
+    """
+    import subprocess
+
+    if sys.platform != "linux":
+        logging.error("udev rules are a Linux concept; nothing to do on %s.",
+                      sys.platform)
+        sys.exit(-1)
+
+    if args.print_only:
+        print(UDEV_RULES, end="")
+        return
+
+    if os.geteuid() != 0:
+        logging.error(
+            "Installing udev rules needs root. Re-run with sudo:\n"
+            "    sudo -E $(which apollo) install-udev\n"
+            "or write the rules yourself:\n"
+            "    apollo install-udev --print-only | sudo tee %s",
+            UDEV_RULES_PATH)
+        sys.exit(-1)
+
+    with open(UDEV_RULES_PATH, "w") as f:
+        f.write(UDEV_RULES)
+    logging.info("Wrote %s", UDEV_RULES_PATH)
+
+    for argv in (["udevadm", "control", "--reload"], ["udevadm", "trigger"]):
+        result = subprocess.run(argv, capture_output=True, text=True)
+        if result.returncode != 0:
+            logging.error("`%s` failed: %s", " ".join(argv), result.stderr.strip())
+            sys.exit(-1)
+    logging.info("Reloaded udev rules and applied them to connected devices.")
+    logging.info("Replug the Cynthion if it was connected before this ran.")
+
+
 def program_flash_fast(device, args):
     # check if flash-fast is supported
     try:
@@ -377,6 +443,12 @@ COMMANDS = [
             help="Requests the attached ECP5 reconfigure itself from its SPI flash."),
     Command("force-offline", handler=force_fpga_offline,
             help="Forces the board's FPGA offline."),
+
+    # Host setup
+    Command("install-udev", handler=install_udev_rules,
+            args=[(("--print-only",), dict(action='store_true',
+                   help="Print the rules instead of installing them."))],
+            help="Installs the Linux udev rules Apollo needs (requires root)."),
 
     # SPI debug exchanges
     Command("spi", args=["bytes"], handler=debug_spi,
