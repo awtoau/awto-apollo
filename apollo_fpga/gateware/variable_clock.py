@@ -4,7 +4,7 @@
 # Copyright (c) 2020-2026 Great Scott Gadgets <info@greatscottgadgets.com>
 # SPDX-License-Identifier: BSD-3-Clause
 
-""" A clock generator that runs `sync` at any 480/N MHz.
+""" A clock generator that runs `sync` at an arbitrary frequency.
 
 ``LunaECP5DomainGenerator`` always clocks `sync` at 60 MHz and offers only
 60/120/240 elsewhere, which forces a speed ladder to step in factors of two and
@@ -22,112 +22,129 @@ the VCO. Check any change here against ``ecppll`` before trusting it.
 """
 
 import logging
+import re
+import shutil
+import subprocess
+from pathlib import Path
 
 from amaranth import (ClockDomain, ClockSignal, Elaboratable, Instance, Module,
                       ResetSignal, Signal)
 
 
-# The VCO frequency in MHz, and the feedback divider that produces it.
+# Project Trellis's PLL calculator. Asking it is the whole point of this
+# module: the ECP5 PLL has four coupled parameters (CLKI_DIV, CLKFB_DIV,
+# CLKOP_DIV and the VCO they imply) and picking them by hand is how this went
+# wrong twice -- once blaming the output dividers, once "fixing" the VCO to a
+# value that matched the symptoms while being wrong about the cause.
 #
-# These are not free parameters. With FEEDBK_PATH="CLKOP" the loop locks when
-#
-#     CLKOP = input * CLKFB_DIV        and        VCO = CLKOP * CLKOP_DIV
-#
-# so CLKFB_DIV must track CLKOP_DIV. For a 240 MHz CLKOP from a 60 MHz input:
-# CLKFB_DIV = 240/60 = 4, and VCO = 240 * 2 = 480.
-#
-# Verified against Project Trellis's own calculator rather than derived here:
-#
-#     ecppll -i 60 -o 240 --clkout1 160
-#     -> VCO frequency: 480, CLKOP_DIV 2, CLKFB_DIV 4, CLKOS_DIV 3
-#
-# Getting this wrong is quiet and expensive. LUNA uses CLKFB_DIV=8 with
-# CLKOP_DIV=2, which doubles the VCO to 960; carrying that value over here
-# while computing dividers against 480 produced every clock at exactly twice
-# the requested rate. Two rounds of debugging blamed the dividers, and a
-# measurement-based "correction" to VCO_MHZ=960 fitted the observations while
-# being wrong about the cause.
-VCO_MHZ = 480.0
-CLKOP_DIV = 2
-CLKFB_DIV = 4
-
-# ECP5 output dividers are integers; 1 is the VCO itself, which is not a usable
-# fabric clock on this part.
-MIN_DIV = 2
-MAX_DIV = 128
+# ecppll ships with the OSS CAD Suite and chooses a different VCO per target
+# frequency: 480 MHz for 240, 576 for 192, 640 for 160. Any implementation
+# that assumes one fixed VCO can only reach that VCO's integer divisions,
+# which is why an earlier version could produce 240, 160 and 120 MHz but
+# nothing in between.
+# Located rather than assumed to be on PATH: ecppll lives in the OSS CAD Suite,
+# which is usually only on PATH inside its own environment, so a build script
+# that sources that environment finds it while an ordinary import does not.
+def _find_ecppll():
+    found = shutil.which("ecppll")
+    if found:
+        return found
+    for candidate in (Path.home() / "opt/oss-cad-suite/bin/ecppll",):
+        if candidate.exists():
+            return str(candidate)
+    return "ecppll"
 
 
-def achievable_frequencies(min_mhz=20.0, max_mhz=250.0):
-    """ Every sync frequency this can produce, as (frequency_mhz, divider). """
-    return [(VCO_MHZ / div, div)
-            for div in range(MIN_DIV, MAX_DIV + 1)
-            if min_mhz <= VCO_MHZ / div <= max_mhz]
+ECPPLL = _find_ecppll()
 
 
-def nearest_frequency(requested_mhz):
-    """ The achievable frequency closest to `requested_mhz`, and its divider.
+def _ecppll(sync_mhz, input_mhz=60.0):
+    """ Ask ecppll for a configuration, returning its parameters as a dict.
 
-    Snapping rather than raising: the caller is usually a ladder script that
-    wants to know what it actually got, and every result is reported with the
-    real frequency rather than the requested one.
+    Raises if ecppll is unavailable: guessing the parameters is precisely the
+    failure mode this exists to avoid, so a silent fallback would be worse
+    than not building.
     """
-    return min(achievable_frequencies(min_mhz=1.0, max_mhz=VCO_MHZ),
-               key=lambda pair: abs(pair[0] - requested_mhz))
+    result = subprocess.run(
+        [ECPPLL, "-i", str(input_mhz), "-o", str(sync_mhz), "-f", "/dev/stdout"],
+        capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"{ECPPLL} could not generate a {sync_mhz} MHz clock from "
+            f"{input_mhz} MHz: {result.stderr.strip()}")
+
+    params = {}
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        match = re.match(r"\.(\w+)\(([^)]*)\),?", line)
+        if match:
+            name, value = match.group(1), match.group(2).strip('"')
+            params[name] = int(value) if value.lstrip("-").isdigit() else value
+        match = re.match(r"clkout0 frequency: ([\d.]+) MHz", line)
+        if match:
+            params["_actual_mhz"] = float(match.group(1))
+        match = re.match(r"VCO frequency: ([\d.]+)", line)
+        if match:
+            params["_vco_mhz"] = float(match.group(1))
+    return params
 
 
 class VariableClockDomainGenerator(Elaboratable):
-    """ Generates `sync` at an arbitrary 480/N MHz, with `usb` fixed at 60.
+    """ Generates `sync` at an arbitrary frequency, with `usb` fixed at 60 MHz.
 
     Parameters
     ----------
     sync_mhz : float
-        Desired sync frequency. Snapped to the nearest achievable value; read
-        ``actual_sync_mhz`` for what was produced.
+        Desired sync frequency. ecppll picks the dividers and the VCO.
 
     Attributes
     ----------
     actual_sync_mhz : float
-        The frequency actually generated. Report this rather than the request:
-        every rate derived from it would otherwise be wrong by the snapping
-        error.
+        What ecppll says will actually be produced. Report this rather than the
+        request: rates derived from a requested value that was not achieved are
+        wrong by exactly the rounding error.
     """
 
-    def __init__(self, *, sync_mhz=60.0):
+    def __init__(self, *, sync_mhz=60.0, input_mhz=60.0):
         self.requested_sync_mhz = sync_mhz
-        self.actual_sync_mhz, self._sync_div = nearest_frequency(sync_mhz)
+        self._params = _ecppll(sync_mhz, input_mhz)
+        self.actual_sync_mhz = self._params.get("_actual_mhz", sync_mhz)
+        self.vco_mhz = self._params.get("_vco_mhz")
 
         if abs(self.actual_sync_mhz - sync_mhz) > 0.01:
             logging.info("sync %.1f MHz requested, %.1f MHz produced "
-                         "(VCO %.0f / %d)",
-                         sync_mhz, self.actual_sync_mhz, VCO_MHZ,
-                         self._sync_div)
+                         "(VCO %.0f)",
+                         sync_mhz, self.actual_sync_mhz, self.vco_mhz or 0)
 
     def elaborate(self, platform):
         m = Module()
 
         m.domains.sync = ClockDomain()
-        m.domains.fast = ClockDomain()
         m.domains.usb  = ClockDomain()
 
-        clk_240  = Signal()   # CLKOP, the feedback path
-        clk_sync = Signal()   # CLKOS, the parameterised output
-        clk_60   = Signal()   # CLKOS2, for USB
+        clk_sync = Signal()
+        clk_usb  = Signal()
         locked   = Signal()
 
+        params = self._params
         input_clock = platform.request(platform.default_clk).i
+
+        # sync comes from CLKOP, which is also the feedback path, so ecppll's
+        # CLKOP_DIV/CLKFB_DIV pair is used exactly as given. usb comes from a
+        # secondary output divided to 60 MHz.
+        usb_div = int(round((params["_vco_mhz"]) / 60.0))
 
         m.submodules.pll = Instance(
             "EHXPLLL",
 
             i_CLKI=input_clock,
-            i_CLKFB=clk_240,
+            i_CLKFB=clk_sync,
             i_PHASESEL0=0, i_PHASESEL1=0,
             i_PHASEDIR=1, i_PHASESTEP=1, i_PHASELOADREG=1,
             i_STDBY=0, i_PLLWAKESYNC=0, i_RST=0, i_ENCLKOP=0,
 
-            o_CLKOP=clk_240,
-            o_CLKOS=clk_sync,
-            o_CLKOS2=clk_60,
+            o_CLKOP=clk_sync,
+            o_CLKOS=clk_usb,
             o_LOCK=locked,
 
             p_PLLRST_ENA="DISABLED",
@@ -139,38 +156,19 @@ class VariableClockDomainGenerator(Elaboratable):
             p_OUTDIVIDER_MUXC="DIVC",
             p_OUTDIVIDER_MUXD="DIVD",
 
-            p_CLKI_DIV=1,
-            p_CLKFB_DIV=CLKFB_DIV,
+            p_CLKI_DIV=params["CLKI_DIV"],
+            p_CLKFB_DIV=params["CLKFB_DIV"],
             p_FEEDBK_PATH="CLKOP",
 
-            # CLKOP closes the feedback loop, so its divider sets the VCO and
-            # must stay at LUNA's value.
             p_CLKOP_ENABLE="ENABLED",
-            p_CLKOP_DIV=CLKOP_DIV,
-            p_CLKOP_CPHASE=1,
+            p_CLKOP_DIV=params["CLKOP_DIV"],
+            p_CLKOP_CPHASE=params["CLKOP_DIV"] - 1,
             p_CLKOP_FPHASE=0,
-            p_CLKOP_TRIM_DELAY="0",
-            p_CLKOP_TRIM_POL="FALLING",
 
-            # The one parameter that varies.
             p_CLKOS_ENABLE="ENABLED",
-            p_CLKOS_DIV=self._sync_div,
-            p_CLKOS_CPHASE=self._sync_div - 1,
+            p_CLKOS_DIV=usb_div,
+            p_CLKOS_CPHASE=usb_div - 1,
             p_CLKOS_FPHASE=0,
-            p_CLKOS_TRIM_DELAY="0",
-            p_CLKOS_TRIM_POL="FALLING",
-
-            p_CLKOS2_ENABLE="ENABLED",
-            p_CLKOS2_DIV=8,
-            p_CLKOS2_CPHASE=7,
-            p_CLKOS2_FPHASE=0,
-
-            # Left DISABLED, as LUNA has it. Enabling this with CLKOS3_DIV=1
-            # is what produced a 480 MHz sync domain in the first attempt.
-            p_CLKOS3_ENABLE="DISABLED",
-            p_CLKOS3_DIV=1,
-            p_CLKOS3_CPHASE=0,
-            p_CLKOS3_FPHASE=0,
 
             a_ICP_CURRENT="12",
             a_LPF_RESISTOR="8",
@@ -180,16 +178,11 @@ class VariableClockDomainGenerator(Elaboratable):
 
         m.d.comb += [
             ClockSignal("sync").eq(clk_sync),
-            # `fast` is the 240 MHz output. Nothing here uses it as a data
-            # clock; it exists because LUNA's PHYs expect the domain to be
-            # present.
-            ClockSignal("fast").eq(clk_240),
-            ClockSignal("usb") .eq(clk_60),
+            ClockSignal("usb") .eq(clk_usb),
 
-            # Hold every domain in reset until the PLL locks: a domain clocked
+            # Hold both domains in reset until the PLL locks: a domain clocked
             # by an unlocked PLL sees a frequency that drifts as it settles.
             ResetSignal("sync").eq(~locked),
-            ResetSignal("fast").eq(~locked),
             ResetSignal("usb") .eq(~locked),
         ]
 
