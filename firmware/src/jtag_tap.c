@@ -19,7 +19,10 @@
 #include "jtag.h"
 #include "apollo_mode.h"
 
-void jtag_state_ack(bool tms);
+// Internal to this file -- deliberately not in jtag.h. static so the compiler
+// may inline/clone them into their callers below rather than being forced to
+// emit externally-visible definitions (awtoau/cynthion-workspace#73).
+static void jtag_state_ack(bool tms);
 
 /*
  * Low nibble : TMS == 0
@@ -173,7 +176,9 @@ void jtag_init(void)
  */
 void jtag_deinit(void)
 {
-	uint16_t gpio_pins[] = {
+	// static const so the table lives in flash rather than being rebuilt on the
+	// stack on every call (see awtoau/cynthion-workspace#73).
+	static const uint16_t gpio_pins[] = {
 		TDO_GPIO, TDI_GPIO, TCK_GPIO, TMS_GPIO,
 	};
 
@@ -251,7 +256,7 @@ void jtag_tap_shift(
 	}
 }
 
-void jtag_state_ack(bool tms)
+static void jtag_state_ack(bool tms)
 {
 	if (tms) {
 		jtag_set_current_state((tms_transitions[jtag_current_state()] >> 4) & 0xf);
@@ -260,7 +265,7 @@ void jtag_state_ack(bool tms)
 	}
 }
 
-void jtag_state_step(bool tms)
+static void jtag_state_step(bool tms)
 {
 	if (tms) {
 		jtag_set_tms();
