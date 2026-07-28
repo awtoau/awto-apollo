@@ -133,10 +133,22 @@ class QSPIFlashController(wiring.Component):
             self._inner.divisor         .eq(self.divisor),
         ]
 
-        # The controller drives SCK as two bits, one per half of the sync
-        # cycle, since it clocks at DDR rate internally. USRMCLK takes a
-        # single-ended clock, so only the first half is forwarded; the
-        # effective SCK is the sync rate divided by the divisor.
+        # SCK comes out of a DDR output register, so ddr_o is two bits: bit 0
+        # is driven during the first half of the sync cycle, bit 1 during the
+        # second. USRMCLK takes a single clock input, so only bit 0 is
+        # forwarded.
+        #
+        # That is lossless for divisor >= 1, where both halves always hold the
+        # same value and SCK is a whole number of sync cycles. It is NOT
+        # lossless at divisor 0, where a full clock period lives inside one
+        # sync cycle and exists only as the difference between the halves:
+        # keeping bit 0 alone leaves a constant 0, the flash never sees a
+        # clock, and reads return zeros at every sample offset. This is the
+        # sole reason 60 MHz SCK fails; the part is rated to 104 MHz.
+        #
+        # To lift it, serialise both halves through an ODDRX1F clocked at 2x
+        # and drive USRMCLK from its output -- the construction LUNA already
+        # uses for the HyperRAM clock (i_D0/i_D1 -> o_Q).
         m.d.comb += self.sck.eq(self._sck_port.ddr_o[0])
 
         m.submodules.usrmclk = Instance(
