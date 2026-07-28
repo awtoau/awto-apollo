@@ -237,6 +237,46 @@ class SidebandTest(unittest.TestCase):
         self.assertTrue(all(s == 1 for s in samples),
                         "line was driven low with no command pending")
 
+    def test_leds_indicate_activity(self):
+        """The status LEDs must reflect what the responder is doing.
+
+        A link that fails silently is hard to diagnose on a bench; these make
+        the responder's state visible without attaching a debugger.
+        """
+        dut = SidebandResponder(clk_freq_hz=CLK_HZ, baud=BAUD)
+        m = Module()
+        m.submodules.dut = dut
+        sim = Simulator(m)
+        sim.add_clock(1 / CLK_HZ)
+        seen = []
+
+        async def drive(ctx):
+            ctx.set(dut.rx, 1)
+            for _ in range(DIVISOR * 2):
+                await ctx.tick()
+                seen.append(ctx.get(dut.leds))
+            for bit in [0] + [(CMD_POWER >> i) & 1 for i in range(8)] + [1]:
+                ctx.set(dut.rx, bit)
+                for _ in range(DIVISOR):
+                    await ctx.tick()
+                    seen.append(ctx.get(dut.leds))
+            ctx.set(dut.rx, 1)
+            for _ in range(DIVISOR * 10 * 22):
+                await ctx.tick()
+                seen.append(ctx.get(dut.leds))
+
+        sim.add_testbench(drive)
+        sim.run()
+
+        self.assertTrue(any(v & 0b000001 for v in seen),
+                        "no LED showed a command byte arriving")
+        self.assertTrue(any(v & 0b000010 for v in seen),
+                        "no LED showed a response being transmitted")
+        self.assertTrue(any(v & 0b001000 for v in seen),
+                        "the POWER-command LED never lit")
+        self.assertFalse(any(v & 0b100000 for v in seen),
+                         "the unknown-command LED lit for a valid command")
+
     def test_tx_active_is_low_when_idle(self):
         """tx_active drives the tri-state; asserting it while idle would hold
         the shared wire and block Apollo from transmitting."""

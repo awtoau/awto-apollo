@@ -194,6 +194,18 @@ class SidebandResponder(Elaboratable):
         self.reconfigured = Signal()
         self.state        = Signal(2)
 
+        # Six-bit status display, for wiring to the board LEDs. A link that
+        # fails silently is hard to diagnose; this makes the responder's state
+        # visible without a debug session.
+        #
+        #   0  a command byte was received (stretched, so it is visible)
+        #   1  currently transmitting a response
+        #   2  last command was understood
+        #   3  last command was POWER
+        #   4  heartbeat -- toggles per response, so it blinks under polling
+        #   5  a command was rejected as unknown (latched until the next good one)
+        self.leds = Signal(6)
+
     def elaborate(self, platform):
         m = Module()
 
@@ -208,6 +220,24 @@ class SidebandResponder(Elaboratable):
         # is executing, where a repeated value could be a wedged state machine
         # replaying a stale buffer.
         heartbeat = Signal()
+
+        #
+        # Status LEDs.
+        #
+        # A received byte lasts one clock, which is invisible. Stretch it to
+        # roughly 1/8 second so a single command produces a perceptible flash
+        # and a polled link looks like steady flicker.
+        #
+        stretch_bits = max((self.divisor * 8).bit_length(), 20)
+        rx_stretch   = Signal(stretch_bits)
+        unknown_cmd  = Signal()
+        last_power   = Signal()
+        last_ok      = Signal()
+
+        with m.If(rx_uart.strobe):
+            m.d.sync += rx_stretch.eq(-1)
+        with m.Elif(rx_stretch != 0):
+            m.d.sync += rx_stretch.eq(rx_stretch - 1)
 
         status = Signal(8)
         ok     = Signal()
@@ -243,6 +273,15 @@ class SidebandResponder(Elaboratable):
 
         command = Signal(8)
 
+        m.d.comb += self.leds.eq(Cat(
+            rx_stretch != 0,   # 0: a command byte arrived recently
+            self.tx_active,    # 1: transmitting a response
+            last_ok,           # 2: last command understood
+            last_power,        # 3: last command was POWER
+            heartbeat,         # 4: toggles per response
+            unknown_cmd,       # 5: last command rejected
+        ))
+
         with m.FSM():
 
             with m.State("IDLE"):
@@ -254,19 +293,23 @@ class SidebandResponder(Elaboratable):
                     with m.Switch(rx_uart.data):
                         with m.Case(CMD_PING):
                             m.d.sync += [ok.eq(1),
-                                         payload_len.eq(PAYLOAD_SIZE[CMD_PING])]
+                                         payload_len.eq(PAYLOAD_SIZE[CMD_PING]),
+                                         last_power.eq(0), unknown_cmd.eq(0)]
                         with m.Case(CMD_STATUS):
                             m.d.sync += [ok.eq(1),
-                                         payload_len.eq(PAYLOAD_SIZE[CMD_STATUS])]
+                                         payload_len.eq(PAYLOAD_SIZE[CMD_STATUS]),
+                                         last_power.eq(0), unknown_cmd.eq(0)]
                         with m.Case(CMD_POWER):
                             m.d.sync += [ok.eq(1),
-                                         payload_len.eq(PAYLOAD_SIZE[CMD_POWER])]
+                                         payload_len.eq(PAYLOAD_SIZE[CMD_POWER]),
+                                         last_power.eq(1), unknown_cmd.eq(0)]
                         with m.Default():
                             # Unknown command: status alone, OK clear. The
                             # master still gets a well-formed reply rather than
                             # a timeout, so it can tell "not understood" from
                             # "not there".
-                            m.d.sync += [ok.eq(0), payload_len.eq(0)]
+                            m.d.sync += [ok.eq(0), payload_len.eq(0),
+                                         unknown_cmd.eq(1)]
 
                     m.d.sync += byte_index.eq(0)
                     m.next = "SETTLE"
@@ -338,7 +381,7 @@ class SidebandResponder(Elaboratable):
             with m.State("FINISH"):
                 m.d.comb += self.tx_active.eq(1)
                 with m.If(~tx_uart.busy):
-                    m.d.sync += heartbeat.eq(~heartbeat)
+                    m.d.sync += [heartbeat.eq(~heartbeat), last_ok.eq(ok)]
                     m.next = "IDLE"
 
         return m
