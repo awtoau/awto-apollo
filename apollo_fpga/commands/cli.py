@@ -15,6 +15,7 @@ import time
 import errno
 import logging
 import argparse
+import usb.core
 from collections import namedtuple
 import xdg.BaseDirectory
 from functools import partial
@@ -249,7 +250,8 @@ def program_flash_fast(device, args):
     try:
         from amaranth.build.run import LocalBuildProducts
         from luna.gateware.platform import get_appropriate_platform
-        from apollo_fpga.gateware.flash_bridge import FlashBridge, FlashBridgeConnection
+        from apollo_fpga.gateware.flash_bridge import (
+            FlashBridge, FlashBridgeConnection, FlashBridgeNotFound)
     except ImportError:
         logging.error("`flash --fast` requires the `luna` package in the Python environment.\n"
                       "Install `luna` or use `flash` instead.")
@@ -273,15 +275,37 @@ def program_flash_fast(device, args):
         programmer = device.create_jtag_programmer(jtag)
         programmer.configure(products.get("top.bit"))
 
-    # Let the LUNA gateware take over in devices with shared USB port
-    device.allow_fpga_takeover_usb()
-
-    # Program SPI flash memory using the configured bridge
-    bridge = FlashBridgeConnection()
-    programmer = ECP5FlashBridgeProgrammer(bridge=bridge)
+    # Read the bitstream before handing the USB port over: a missing or
+    # unreadable file should fail while Apollo still owns the port, not after.
     with open(args.file, "rb") as f:
         bitstream = f.read()
-    programmer.flash(bitstream)
+
+    # Let the LUNA gateware take over in devices with shared USB port.
+    # From here until the bridge hands back, Apollo is off the bus.
+    device.allow_fpga_takeover_usb()
+
+    # Program SPI flash memory using the configured bridge.
+    #
+    # The context manager matters: if the bridge never enumerates, or the
+    # transfer fails partway, the port must still go back to Apollo. Without
+    # that, a failed flash-fast leaves the debug controller unreachable and
+    # only a physical replug recovers it (issue #75).
+    try:
+        with FlashBridgeConnection() as bridge:
+            programmer = ECP5FlashBridgeProgrammer(bridge=bridge)
+            programmer.flash(bitstream)
+    except FlashBridgeNotFound as e:
+        logging.error(
+            f"Flash bridge did not enumerate: {e}\n"
+            "The bridge gateware holds the shared USB port, so Apollo is off "
+            "the bus until it hands back. If the device stays missing, replug "
+            "it and check that `apollo install-udev` has been run -- the "
+            "bridge enumerates as 1209:000f and needs its own udev rule."
+        )
+        sys.exit(-1)
+    except usb.core.USBError as e:
+        logging.error(f"Flash bridge transfer failed: {e}")
+        sys.exit(-1)
 
 
 def program_flash_fast_deprecated(device, args):
