@@ -29,16 +29,26 @@ static led_pattern_t led_pattern = LED_IDLE;
 
 
 /**
+ * The LED pins, in display order.
+ *
+ * File-scope and const so the table lives in flash. It was previously spelled
+ * out as a non-const local in four separate functions, which made the compiler
+ * emit code to rebuild it on the stack at each call site -- four copies of the
+ * same constant data plus the stores to construct it. On a part this close to
+ * full that is not affordable. See awtoau/cynthion-workspace#73.
+ */
+static const led_t led_pins[LED_COUNT] = { LED_A, LED_B, LED_C, LED_D, LED_E };
+
+
+/**
  * Sets up each of the LEDs for use.
  */
 void led_init(void)
 {
-    uint8_t pins[] = { LED_A, LED_B, LED_C, LED_D, LED_E };
-
     // Default each LED to an output and _off_.
     for (unsigned i = 0; i < LED_COUNT; ++i) {
-        gpio_set_pin_direction(pins[i], GPIO_DIRECTION_OUT);
-        gpio_set_pin_level(pins[i], true);
+        gpio_set_pin_direction(led_pins[i], GPIO_DIRECTION_OUT);
+        gpio_set_pin_level(led_pins[i], true);
     }
 }
 
@@ -84,10 +94,8 @@ void led_set(led_t led, bool on)
  */
 void leds_off(void)
 {
-  led_t leds[] = {LED_A, LED_B, LED_C, LED_D, LED_E};
-
-  for (unsigned i = 0; i < 5; ++i) {
-    led_off(leds[i]);
+  for (unsigned i = 0; i < LED_COUNT; ++i) {
+    led_off(led_pins[i]);
   }
 }
 
@@ -97,10 +105,8 @@ void leds_off(void)
  */
 void leds_on(void)
 {
-  led_t leds[] = {LED_A, LED_B, LED_C, LED_D, LED_E};
-
-  for (unsigned i = 0; i < 5; ++i) {
-    led_on(leds[i]);
+  for (unsigned i = 0; i < LED_COUNT; ++i) {
+    led_on(led_pins[i]);
   }
 }
 
@@ -110,10 +116,8 @@ void leds_on(void)
  */
 static void display_led_number(uint8_t number)
 {
-  led_t leds[] = {LED_A, LED_B, LED_C, LED_D, LED_E};
-
-  if (number < 5) {
-    led_on(leds[number]);
+  if (number < LED_COUNT) {
+    led_on(led_pins[number]);
   }
 }
 
