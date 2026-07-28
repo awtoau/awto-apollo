@@ -86,7 +86,7 @@ void detect_hardware_revision(void)
     */
 
     // Identify the board revision by comparing against expected thresholds.
-    struct {
+    static const struct {
         uint16_t version;
         uint16_t threshold;
     } revisions[] = {
