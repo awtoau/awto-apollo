@@ -11,6 +11,7 @@ from operator import invert
 import os
 import sys
 import ast
+import shutil
 import time
 import errno
 import logging
@@ -260,15 +261,39 @@ def program_flash_fast(device, args):
     # get platform
     platform=get_appropriate_platform()
 
-    # Retrieve a FlashBridge cached bitstream or build it
+    # Retrieve a FlashBridge cached bitstream or build it.
     plan = platform.build(FlashBridge(), do_build=False)
     cache_dir = os.path.join(
         xdg.BaseDirectory.save_cache_path('apollo'), 'build', plan.digest().hex()
     )
-    if os.path.exists(cache_dir):
+
+    # Test for the artifact, not the directory. A build that dies partway --
+    # most easily by the FPGA toolchain not being on PATH, which exits 127 --
+    # leaves the directory behind with intermediates but no top.bit. Keying the
+    # cache on the directory then skips the rebuild forever and fails later on
+    # a missing file, so the cache stays permanently poisoned.
+    cached_bitstream = os.path.join(cache_dir, "top.bit")
+    if os.path.exists(cached_bitstream):
         products = LocalBuildProducts(cache_dir)
     else:
-        products = plan.execute_local(cache_dir)
+        # Fail with something actionable rather than a raw CalledProcessError.
+        missing = [t for t in ("yosys", "nextpnr-ecp5") if shutil.which(t) is None]
+        if missing:
+            logging.error(
+                f"Cannot build the flash bridge gateware: {', '.join(missing)} "
+                "not found on PATH.\n"
+                "Source the FPGA toolchain environment (e.g. the OSS CAD Suite "
+                "'environment' script) and retry, or use `flash` instead of "
+                "`flash --fast`."
+            )
+            sys.exit(-1)
+        try:
+            products = plan.execute_local(cache_dir)
+        except Exception:
+            # Do not leave a half-built directory to be mistaken for a cache
+            # hit on the next run.
+            shutil.rmtree(cache_dir, ignore_errors=True)
+            raise
 
     # Configure flash bridge
     with device.jtag as jtag:
