@@ -72,6 +72,14 @@ uint8_t fpga_adv_command(uint8_t command, uint8_t *buffer, uint8_t length);
 uint8_t fpga_adv_crc8(const uint8_t *data, uint8_t length);
 
 /**
+ * Diagnostic: drive FPGA_ADV as a 10 Hz square wave, bypassing UART framing.
+ *
+ * Isolates "can Apollo drive this pin at all" from "does the transmit path
+ * work". Off by default.
+ */
+void fpga_adv_set_toggle(bool enable);
+
+/**
  * Task for things related with the advertisement pin
  */
 void fpga_adv_task(void);

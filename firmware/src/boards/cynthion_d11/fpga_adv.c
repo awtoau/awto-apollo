@@ -73,6 +73,11 @@ static volatile uint32_t last_heartbeat = 0;
 // tx_frame holds start bit + 8 data + stop, shifted out LSB first.
 // tx_bits_left doubles as the "transmitting" flag: zero means idle.
 //
+// Diagnostic square-wave state; see fpga_adv_set_toggle().
+static bool     toggle_enabled = false;
+static bool     toggle_level   = false;
+static uint32_t toggle_last    = 0;
+
 static volatile uint16_t tx_frame     = 0;
 static volatile uint8_t  tx_bits_left = 0;
 
@@ -161,7 +166,11 @@ static void fpga_adv_tx_timer_init(void)
 	TX_TC->COUNT16.CC[0].reg = (CONF_CPU_FREQUENCY / ADV_UART_BAUD) - 1;
 	while (TX_TC->COUNT16.STATUS.reg & TC_STATUS_SYNCBUSY);
 
-	TX_TC->COUNT16.INTENSET.reg = TC_INTENSET_MC0;
+	// OVF, not MC0. In MFRQ mode CC0 is the TOP value and the counter wraps at
+	// it (datasheet 30.6.2.5), so the period event is an overflow -- there is
+	// no compare match to catch. Enabling MC0 here produced a timer that ran
+	// but never interrupted, so nothing was ever transmitted.
+	TX_TC->COUNT16.INTENSET.reg = TC_INTENSET_OVF;
 
 	// Below USB. The SAMD11 BSP never calls NVIC_SetPriority, so USB sits at
 	// the default 0. If this ISR could preempt USB, bit-banging would delay
@@ -316,11 +325,19 @@ uint8_t fpga_adv_command(uint8_t command, uint8_t *buffer, uint8_t length)
 		return 0;
 	}
 
-	// Arm the collector before transmitting: the FPGA starts replying as soon
-	// as it has the command byte, so arming afterwards can miss the first byte.
+	// Transmit first, then arm the collector.
+	//
+	// The SERCOM receiver stays enabled while we bit-bang the pin, so it sees
+	// our own command byte echoed back. Arming beforehand captured that echo
+	// as response byte 0, pushing every real byte one position along and
+	// leaving response_len short -- which showed up as complete-or-nothing
+	// replies, mostly nothing.
+	//
+	// Arming afterwards is safe because the FPGA cannot begin replying until
+	// it has the whole command byte, and the pin handover in TC1_Handler
+	// happens before this line runs.
 	response_len  = 0;
 	response_want = length;
-
 	fpga_adv_tx_byte(command);
 
 	// The one timeout in the protocol. It does not guard a state machine --
@@ -380,6 +397,35 @@ uint8_t fpga_adv_crc8(const uint8_t *data, uint8_t length)
 }
 
 /**
+ * Diagnostic: drive FPGA_ADV as a raw square wave.
+ *
+ * Bypasses the UART framing entirely -- no TC1, no shift register, just a GPIO
+ * toggled from the main loop. If the FPGA sees edges from this but not from
+ * fpga_adv_tx_byte(), the fault is in the transmit path rather than in the pin
+ * configuration or the wire.
+ *
+ * Enabled by fpga_adv_set_toggle(); disabled by default so it cannot interfere
+ * with normal operation.
+ */
+void fpga_adv_set_toggle(bool enable)
+{
+#ifdef BOARD_HAS_USB_SWITCH
+	toggle_enabled = enable;
+	if (enable) {
+		// Take the pin off the SERCOM and drive it directly.
+		gpio_set_pin_function(FPGA_ADV, GPIO_PIN_FUNCTION_OFF);
+		gpio_set_pin_direction(FPGA_ADV, GPIO_DIRECTION_OUT);
+	} else {
+		gpio_set_pin_direction(FPGA_ADV, GPIO_DIRECTION_IN);
+		gpio_set_pin_pull_mode(FPGA_ADV, GPIO_PULL_UP);
+		gpio_set_pin_function(FPGA_ADV, MUX_PA09C_SERCOM1_PAD3);
+	}
+#else
+	(void)enable;
+#endif
+}
+
+/**
  * The advertisement mode currently in effect.
  */
 fpga_adv_mode_t fpga_adv_get_mode(void)
@@ -397,6 +443,17 @@ fpga_adv_mode_t fpga_adv_get_mode(void)
 void fpga_adv_task(void)
 {
 #ifdef BOARD_HAS_USB_SWITCH
+	// Diagnostic square wave: 10 Hz, so 50 ms per half period. Checked before
+	// the mode logic because it deliberately overrides normal operation.
+	if (toggle_enabled) {
+		if (board_millis() - toggle_last >= 50) {
+			toggle_last  = board_millis();
+			toggle_level = !toggle_level;
+			gpio_set_pin_level(FPGA_ADV, toggle_level);
+		}
+		return;
+	}
+
 	if (adv_mode == FPGA_ADV_MODE_EIC) {
 		// Wait for the defined time window.
 		if (board_millis() - last_update < WINDOW_PERIOD_MS) return;
@@ -532,7 +589,7 @@ void SERCOM1_Handler(void) {
  * and this runs on the path that decides USB port ownership.
  */
 void TC1_Handler(void) {
-  TX_TC->COUNT16.INTFLAG.reg = TC_INTFLAG_MC0;
+  TX_TC->COUNT16.INTFLAG.reg = TC_INTFLAG_OVF;
 
   if (tx_bits_left == 0) {
     // Frame done: stop the counter and hand the pin back to the receiver, so

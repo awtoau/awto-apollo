@@ -254,6 +254,12 @@ static bool handle_fpga_adv_mode(uint8_t rhport, tusb_control_request_t const* r
 	// high byte the expected response length. Folded into this request rather
 	// than given its own opcode -- same subsystem, and one dispatch case is
 	// cheaper than a second handler.
+	// wValue 0xFFFD toggles the diagnostic square wave: wIndex 1 on, 0 off.
+	if (request->wValue == 0xFFFD) {
+		fpga_adv_set_toggle(request->wIndex != 0);
+		return tud_control_xfer(rhport, request, NULL, 0);
+	}
+
 	if (request->wValue == 0xFFFE) {
 		static uint8_t reply[18];
 		uint8_t want = (request->wIndex >> 8) & 0xFF;
