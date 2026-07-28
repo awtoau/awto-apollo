@@ -182,6 +182,91 @@ class FlashIDReader(Elaboratable):
         return m
 
 
+class FlashStatusReader(Elaboratable):
+    """ Reads the three status registers.
+
+    Register 2 carries the Quad Enable bit, which must be set before any quad
+    read will work -- and setting it is not free: with QE=1 the /WP and /HOLD
+    pins become IO2 and IO3, so hardware write protection is gone. Reading the
+    bit before deciding anything is therefore worth a block of its own.
+
+    Attributes
+    ----------
+    start : Signal(), in
+        Strobe to read all three registers.
+    status : Signal(24), out
+        Registers 1, 2 and 3, least-significant byte first.
+    valid : Signal(), out
+        High once a read has completed.
+    """
+
+    # Read Status Register-1 (05h), -2 (35h) and -3 (15h).
+    OPCODES = (0x05, 0x35, 0x15)
+
+    def __init__(self):
+        self.spi = SPIPort()
+
+        self.start  = Signal()
+        self.status = Signal(24)
+        self.valid  = Signal()
+        self.busy   = Signal()
+
+    def elaborate(self, platform):
+        m = Module()
+
+        which    = Signal(range(len(self.OPCODES)))
+        opcode   = Signal(8)
+        got_byte = Signal()
+
+        with m.Switch(which):
+            for index, code in enumerate(self.OPCODES):
+                with m.Case(index):
+                    m.d.comb += opcode.eq(code)
+
+        # Each register is a two-byte transaction: opcode out, value back. The
+        # value arrives on the second byte, so the first return is discarded.
+        with m.FSM():
+            with m.State("IDLE"):
+                with m.If(self.start):
+                    m.d.sync += [which.eq(0), got_byte.eq(0)]
+                    m.next = "OPCODE"
+
+            with m.State("OPCODE"):
+                m.d.comb += [
+                    self.busy             .eq(1),
+                    self.spi.input.valid  .eq(1),
+                    self.spi.input.payload.eq(opcode),
+                    self.spi.input.last   .eq(0),
+                ]
+                with m.If(self.spi.input.ready):
+                    m.next = "VALUE"
+
+            with m.State("VALUE"):
+                m.d.comb += [
+                    self.busy             .eq(1),
+                    self.spi.input.valid  .eq(~got_byte),
+                    self.spi.input.payload.eq(0),
+                    self.spi.input.last   .eq(1),
+                ]
+                with m.If(self.spi.input.valid & self.spi.input.ready):
+                    m.d.sync += got_byte.eq(1)
+
+                with m.If(self.spi.output.valid & self.spi.output.last):
+                    m.d.sync += [
+                        self.status.word_select(which, 8)
+                            .eq(self.spi.output.payload),
+                        got_byte.eq(0),
+                    ]
+                    with m.If(which == len(self.OPCODES) - 1):
+                        m.d.sync += self.valid.eq(1)
+                        m.next = "IDLE"
+                    with m.Else():
+                        m.d.sync += which.eq(which + 1)
+                        m.next = "OPCODE"
+
+        return m
+
+
 class FlashCapture(Elaboratable):
     """ Buffers the first N bytes of a flash read into block RAM.
 
