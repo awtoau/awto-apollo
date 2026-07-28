@@ -352,7 +352,30 @@ class FlashBridgeNotFound(IOError):
     pass
 
 class FlashBridgeConnection:
+    """ Connection to the FPGA-hosted SPI flash bridge.
+
+    Use as a context manager. The bridge gateware holds the shared USB port
+    for as long as this connection is open, so it must be handed back to
+    Apollo on the way out -- including when the body raises:
+
+        with FlashBridgeConnection() as bridge:
+            ...
+
+    Cleanup is deliberately *not* left to __del__. Handing the port back is a
+    USB transfer, and running one from a destructor means doing I/O at GC or
+    interpreter-shutdown time, when the libusb context may already be torn
+    down; that crashed the interpreter rather than reporting an error. It also
+    made recovery non-deterministic: if the object lingered, the port stayed
+    with the FPGA and Apollo appeared to have vanished from the bus.
+    """
+
     def __init__(self):
+        # Set first: close()/__exit__ must be safe even if the lookup below
+        # raises, and must not hand off a port we never took.
+        self.device = None
+        self.interface = None
+        self.endpoint = None
+
         # Try to create a connection to our configuration flash bridge.
         device = ApolloDebugger._find_device(
             ids=[(VENDOR_ID, PRODUCT_ID)],
@@ -367,8 +390,24 @@ class FlashBridgeConnection:
         self.device = device
         self.interface, self.endpoint = self._find_cfg_flash_bridge(device, get_ep=True)
 
-    def __del__(self):
-        self.request_handoff()
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+        return False  # never swallow the caller's exception
+
+    def close(self):
+        """ Hand the USB port back to Apollo. Idempotent and safe to call
+        after a failed __init__. """
+        if self.device is None:
+            return
+        try:
+            self.request_handoff()
+        finally:
+            # Drop the reference either way: a second close() must not retry a
+            # transfer on a handle that may no longer be valid.
+            self.device = None
 
     @staticmethod
     def _find_cfg_flash_bridge(dev, get_ep=False):

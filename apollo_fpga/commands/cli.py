@@ -11,10 +11,12 @@ from operator import invert
 import os
 import sys
 import ast
+import shutil
 import time
 import errno
 import logging
 import argparse
+import usb.core
 from collections import namedtuple
 import xdg.BaseDirectory
 from functools import partial
@@ -249,7 +251,8 @@ def program_flash_fast(device, args):
     try:
         from amaranth.build.run import LocalBuildProducts
         from luna.gateware.platform import get_appropriate_platform
-        from apollo_fpga.gateware.flash_bridge import FlashBridge, FlashBridgeConnection
+        from apollo_fpga.gateware.flash_bridge import (
+            FlashBridge, FlashBridgeConnection, FlashBridgeNotFound)
     except ImportError:
         logging.error("`flash --fast` requires the `luna` package in the Python environment.\n"
                       "Install `luna` or use `flash` instead.")
@@ -258,30 +261,76 @@ def program_flash_fast(device, args):
     # get platform
     platform=get_appropriate_platform()
 
-    # Retrieve a FlashBridge cached bitstream or build it
+    # Retrieve a FlashBridge cached bitstream or build it.
     plan = platform.build(FlashBridge(), do_build=False)
     cache_dir = os.path.join(
         xdg.BaseDirectory.save_cache_path('apollo'), 'build', plan.digest().hex()
     )
-    if os.path.exists(cache_dir):
+
+    # Test for the artifact, not the directory. A build that dies partway --
+    # most easily by the FPGA toolchain not being on PATH, which exits 127 --
+    # leaves the directory behind with intermediates but no top.bit. Keying the
+    # cache on the directory then skips the rebuild forever and fails later on
+    # a missing file, so the cache stays permanently poisoned.
+    cached_bitstream = os.path.join(cache_dir, "top.bit")
+    if os.path.exists(cached_bitstream):
         products = LocalBuildProducts(cache_dir)
     else:
-        products = plan.execute_local(cache_dir)
+        # Fail with something actionable rather than a raw CalledProcessError.
+        missing = [t for t in ("yosys", "nextpnr-ecp5") if shutil.which(t) is None]
+        if missing:
+            logging.error(
+                f"Cannot build the flash bridge gateware: {', '.join(missing)} "
+                "not found on PATH.\n"
+                "Source the FPGA toolchain environment (e.g. the OSS CAD Suite "
+                "'environment' script) and retry, or use `flash` instead of "
+                "`flash --fast`."
+            )
+            sys.exit(-1)
+        try:
+            products = plan.execute_local(cache_dir)
+        except Exception:
+            # Do not leave a half-built directory to be mistaken for a cache
+            # hit on the next run.
+            shutil.rmtree(cache_dir, ignore_errors=True)
+            raise
 
     # Configure flash bridge
     with device.jtag as jtag:
         programmer = device.create_jtag_programmer(jtag)
         programmer.configure(products.get("top.bit"))
 
-    # Let the LUNA gateware take over in devices with shared USB port
-    device.allow_fpga_takeover_usb()
-
-    # Program SPI flash memory using the configured bridge
-    bridge = FlashBridgeConnection()
-    programmer = ECP5FlashBridgeProgrammer(bridge=bridge)
+    # Read the bitstream before handing the USB port over: a missing or
+    # unreadable file should fail while Apollo still owns the port, not after.
     with open(args.file, "rb") as f:
         bitstream = f.read()
-    programmer.flash(bitstream)
+
+    # Let the LUNA gateware take over in devices with shared USB port.
+    # From here until the bridge hands back, Apollo is off the bus.
+    device.allow_fpga_takeover_usb()
+
+    # Program SPI flash memory using the configured bridge.
+    #
+    # The context manager matters: if the bridge never enumerates, or the
+    # transfer fails partway, the port must still go back to Apollo. Without
+    # that, a failed flash-fast leaves the debug controller unreachable and
+    # only a physical replug recovers it (issue #75).
+    try:
+        with FlashBridgeConnection() as bridge:
+            programmer = ECP5FlashBridgeProgrammer(bridge=bridge)
+            programmer.flash(bitstream)
+    except FlashBridgeNotFound as e:
+        logging.error(
+            f"Flash bridge did not enumerate: {e}\n"
+            "The bridge gateware holds the shared USB port, so Apollo is off "
+            "the bus until it hands back. If the device stays missing, replug "
+            "it and check that `apollo install-udev` has been run -- the "
+            "bridge enumerates as 1209:000f and needs its own udev rule."
+        )
+        sys.exit(-1)
+    except usb.core.USBError as e:
+        logging.error(f"Flash bridge transfer failed: {e}")
+        sys.exit(-1)
 
 
 def program_flash_fast_deprecated(device, args):
