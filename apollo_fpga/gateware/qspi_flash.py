@@ -271,6 +271,29 @@ class QuadFlashReader(Elaboratable):
                 # when the last byte is *requested* drops the tail -- observed
                 # in simulation as 7 bytes returned for a length of 8.
                 with m.If(received == self.length):
+                    m.next = "DESELECT"
+
+            with m.State("DESELECT"):
+                # Explicitly deselect the chip. The `chip` field of the last
+                # payload beat cannot do this: by then bytes_left is 0 so
+                # i_stream.valid is low and the frame is never sent, leaving CS
+                # asserted and the flash mid-stream.
+                #
+                # A single read still succeeds -- the first transaction after
+                # configuration is clean -- so this only shows up on the second
+                # read, which then starts partway through the flash's output
+                # and returns data from the wrong address. Observed as byte-
+                # exact on the power-on run and corrupt on every re-trigger,
+                # with the same divisor and identical cycle count.
+                m.d.comb += [
+                    self.busy                      .eq(1),
+                    self.ctrl.i_stream.valid       .eq(1),
+                    self.ctrl.i_stream.payload.chip.eq(0),
+                    self.ctrl.i_stream.payload.oper.eq(Operation.Idle),
+                    self.ctrl.i_stream.payload.data.eq(0),
+                    self.ctrl.o_stream.ready       .eq(1),
+                ]
+                with m.If(self.ctrl.i_stream.ready):
                     m.d.sync += self.done.eq(1)
                     m.next = "IDLE"
 
