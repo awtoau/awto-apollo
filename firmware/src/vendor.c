@@ -55,6 +55,7 @@ enum {
 	VENDOR_REQUEST_TRIGGER_RECONFIGURATION = 0xc0,
 	VENDOR_REQUEST_FORCE_FPGA_OFFLINE      = 0xc1,
 	VENDOR_REQUEST_ALLOW_FPGA_TAKEOVER_USB = 0xc2,
+	VENDOR_REQUEST_FPGA_ADV_MODE           = 0xc3,
 	VENDOR_REQUEST_BOOT_TO_DFU             = 0xed,
 
 
@@ -229,6 +230,37 @@ bool handle_allow_fpga_takeover_usb_finish(uint8_t rhport, tusb_control_request_
 
 
 /**
+ * Get or set how the FPGA advertisement on PA09 is received.
+ *
+ * wValue == 0xFFFF reads the current mode back; any other value selects one
+ * (0 = EIC edge counting, 1 = UART heartbeat). A read is worth having: without
+ * it a host cannot tell which regime Apollo is in, and diagnosing a handoff
+ * problem becomes guesswork.
+ *
+ * The mode is applied here rather than in a _finish handler because
+ * fpga_adv_set_mode() only re-muxes a pin and reconfigures a peripheral -- it
+ * returns normally, unlike the DFU reboot which cannot.
+ */
+bool handle_fpga_adv_mode(uint8_t rhport, tusb_control_request_t const* request)
+{
+	static uint8_t mode;
+
+	if (request->wValue == 0xFFFF) {
+		mode = (uint8_t)fpga_adv_get_mode();
+		return tud_control_xfer(rhport, request, &mode, sizeof(mode));
+	}
+
+	if (!fpga_adv_set_mode((fpga_adv_mode_t)request->wValue)) {
+		// Stall on an unknown mode rather than silently ignoring it: a host
+		// that asked for something we do not implement must find out.
+		return false;
+	}
+
+	return tud_control_xfer(rhport, request, NULL, 0);
+}
+
+
+/**
  * Request that Apollo reboot into the Saturn-V DFU bootloader.
  *
  * The reboot itself is deferred to the ACK stage (see the _finish handler
@@ -392,6 +424,8 @@ static bool handle_vendor_request_setup(uint8_t rhport, tusb_control_request_t c
 			return handle_force_fpga_offline(rhport, request);
 		case VENDOR_REQUEST_ALLOW_FPGA_TAKEOVER_USB:
 			return handle_allow_fpga_takeover_usb(rhport, request);
+		case VENDOR_REQUEST_FPGA_ADV_MODE:
+			return handle_fpga_adv_mode(rhport, request);
 		case VENDOR_REQUEST_BOOT_TO_DFU:
 			return handle_boot_to_dfu(rhport, request);
 
