@@ -706,5 +706,172 @@ class FlashWriteHILTest(unittest.TestCase):
             f"flash-fast crashed (rc={proc.returncode}) -- see #75:\n{combined[-400:]}")
 
 
+@unittest.skipUnless(_HAVE_APOLLO, "apollo_fpga / pyusb not importable")
+@unittest.skipUnless(
+    os.environ.get("APOLLO_TEST_POWER_MONITOR") == "1",
+    "needs the power_monitor bitstream loaded; set "
+    "APOLLO_TEST_POWER_MONITOR=1 once it is")
+class PowerMonitorHILTest(unittest.TestCase):
+    """Reads the PAC1954 power monitor over the JTAG bring-up gateware.
+
+    Requires ecp5-test/power_monitor/build/top.bit to be loaded first:
+
+        apollo configure ecp5-test/power_monitor/build/top.bit
+
+    Opt-in rather than automatic because it needs that specific bitstream --
+    running it against whatever happens to be in SRAM would fail confusingly
+    rather than usefully. See awtoau/cynthion-workspace#82 and
+    docs/luna_ecp5_fpga/pac1954-power-monitor.md.
+
+    Non-destructive: reads only, no writes to the device's configuration.
+    """
+
+    # Mirrors ecp5-test/power_monitor/registers.py. Duplicated rather than
+    # imported because that package lives in the workspace, not this repo, and
+    # this test must run from an apollo checkout alone.
+    JTAG_ID, JTAG_DEV_ADDR, JTAG_REG_ADDR = 1, 2, 3
+    JTAG_TRIGGER, JTAG_DATA, JTAG_STATUS, JTAG_SIZE = 4, 5, 6, 7
+    STATUS_DONE = 0b01
+
+    APPLET_ID = 0x504D4F4E  # "PMON"
+    PAC_ADDRESS = 0x10
+
+    REG_REFRESH, REG_VBUS_BASE, REG_VSENSE_BASE = 0x00, 0x07, 0x0B
+    REG_PRODUCT_ID, REG_MANUFACTURER_ID, REG_REVISION_ID = 0xFD, 0xFE, 0xFF
+    EXPECTED = {"MANUFACTURER_ID": 0x54, "PRODUCT_ID": 0x7B, "REVISION_ID": 0x02}
+
+    CHANNEL_PORTS = {1: "TARGET_A", 2: "TARGET_C", 3: "AUX", 4: "CONTROL"}
+
+    VBUS_VOLTS_PER_LSB = 32.0 / 65536
+    AMPS_PER_LSB = (0.100 / 65536) / 0.020
+
+    # A byte transfer at 100 kHz is ~100 us. Bounded rather than a sleep: on a
+    # NAK, done never asserts, so the loop must terminate for a missing device
+    # to read as "no response" instead of hanging.
+    POLL_ATTEMPTS = 200
+
+    @classmethod
+    def setUpClass(cls):
+        from apollo_fpga import ApolloDebugger
+
+        # Skip rather than error on anything that means "the bitstream is not
+        # there". FlashWriteHILTest reconfigures the FPGA, so in a full-suite
+        # run this class legitimately finds no power_monitor gateware loaded --
+        # that is a skip, not a failure. Reading the ID register against
+        # unrelated (or absent) gateware can also raise rather than return a
+        # wrong value, hence catching broadly here.
+        try:
+            cls.device = ApolloDebugger()
+            cls.regs = cls.device.registers
+            applet = cls.regs.register_read(cls.JTAG_ID)
+        except Exception as e:
+            raise unittest.SkipTest(
+                f"could not read the applet ID ({type(e).__name__}: {e}); "
+                "load ecp5-test/power_monitor/build/top.bit first")
+
+        if applet != cls.APPLET_ID:
+            raise unittest.SkipTest(
+                f"applet ID is {applet:#010x}, expected {cls.APPLET_ID:#010x}; "
+                "load ecp5-test/power_monitor/build/top.bit first "
+                "(FlashWriteHILTest reconfigures the FPGA, so a full-suite run "
+                "will land here)")
+
+    def _read_pac(self, reg, size=1):
+        """Read a PAC195X register; None if the device did not respond."""
+        self.regs.register_write(self.JTAG_DEV_ADDR, self.PAC_ADDRESS)
+        self.regs.register_write(self.JTAG_REG_ADDR, reg)
+        self.regs.register_write(self.JTAG_SIZE, size)
+        self.regs.register_write(self.JTAG_TRIGGER, 1)
+
+        mask = 0xFF if size == 1 else 0xFFFF
+        for _ in range(self.POLL_ATTEMPTS):
+            if self.regs.register_read(self.JTAG_STATUS) & self.STATUS_DONE:
+                return self.regs.register_read(self.JTAG_DATA) & mask
+        return None
+
+    def test_1_device_identifies(self):
+        """The three ID registers must match, proving the I2C link is sound."""
+        for name, reg in (("MANUFACTURER_ID", self.REG_MANUFACTURER_ID),
+                          ("PRODUCT_ID",      self.REG_PRODUCT_ID),
+                          ("REVISION_ID",     self.REG_REVISION_ID)):
+            value = self._read_pac(reg, size=1)
+            self.assertIsNotNone(
+                value, f"{name}: no response from PAC1954 at "
+                       f"{self.PAC_ADDRESS:#04x}")
+            self.assertEqual(
+                value, self.EXPECTED[name],
+                f"{name} is {value:#04x}, expected {self.EXPECTED[name]:#04x}")
+
+    def test_2_read_size_selects_register_width(self):
+        """A 2-byte read of a 1-byte register must not be mistaken for the value.
+
+        The PAC195X auto-increments its address pointer within a read, so
+        reading MANUFACTURER_ID (FEh) two bytes wide returns FEh followed by
+        FFh. Asserting the low byte is the revision documents that behaviour --
+        a size mismatch is silent corruption everywhere else.
+        """
+        wide = self._read_pac(self.REG_MANUFACTURER_ID, size=2)
+        self.assertIsNotNone(wide, "no response to a 2-byte read")
+        self.assertEqual(wide >> 8, self.EXPECTED["MANUFACTURER_ID"],
+                         "high byte of the wide read should be FEh's value")
+        self.assertEqual(wide & 0xFF, self.EXPECTED["REVISION_ID"],
+                         "low byte should be FFh, i.e. the pointer advanced")
+
+    def test_3_at_least_one_rail_is_powered(self):
+        """Something must be supplying the board, or nothing would be running.
+
+        Deliberately does not assert *which* port: that depends on how the
+        board is cabled. It asserts only that the rail carrying us reads a
+        plausible USB voltage, which catches a dead I2C link, a wrong channel
+        mapping, or broken scaling.
+        """
+        self._read_pac(self.REG_REFRESH, size=1)
+
+        readings = {}
+        for channel in range(1, 5):
+            vbus = self._read_pac(self.REG_VBUS_BASE + channel - 1, size=2)
+            vsense = self._read_pac(self.REG_VSENSE_BASE + channel - 1, size=2)
+            self.assertIsNotNone(vbus, f"channel {channel}: no VBUS response")
+            self.assertIsNotNone(vsense, f"channel {channel}: no VSENSE response")
+            readings[self.CHANNEL_PORTS[channel]] = (
+                vbus * self.VBUS_VOLTS_PER_LSB,
+                vsense * self.AMPS_PER_LSB,
+            )
+
+        powered = {p: (v, i) for p, (v, i) in readings.items() if v > 4.0}
+        detail = ", ".join(f"{p}={v:.3f}V/{i * 1000:.1f}mA"
+                           for p, (v, i) in readings.items())
+        self.assertTrue(powered, f"no rail above 4 V -- readings: {detail}")
+
+        for port, (volts, _) in powered.items():
+            self.assertLess(volts, 5.5,
+                            f"{port} reads {volts:.3f} V, above USB spec -- "
+                            f"scaling may be wrong ({detail})")
+
+    def test_4_total_current_is_plausible(self):
+        """Total draw must be non-trivial but far below the 5 A full scale.
+
+        An idle r1.4 draws roughly 65 mA at 5 V. Bounds are deliberately loose:
+        this is a sanity check on the scaling, not a power budget. Zero would
+        mean the shunt readings are dead; amps would mean the LSB size is wrong.
+        """
+        self._read_pac(self.REG_REFRESH, size=1)
+
+        total = 0.0
+        for channel in range(1, 5):
+            vsense = self._read_pac(self.REG_VSENSE_BASE + channel - 1, size=2)
+            self.assertIsNotNone(vsense, f"channel {channel}: no VSENSE response")
+            total += vsense * self.AMPS_PER_LSB
+
+        self.assertGreater(total, 0.005,
+                           f"total draw {total * 1000:.2f} mA is implausibly "
+                           "low -- the board is running, so something must "
+                           "be drawing current")
+        self.assertLess(total, 2.0,
+                        f"total draw {total * 1000:.0f} mA is implausibly high "
+                        "for an idle board -- check the 20 mohm shunt "
+                        "assumption and the FSR configuration")
+
+
 if __name__ == "__main__":
     unittest.main()
