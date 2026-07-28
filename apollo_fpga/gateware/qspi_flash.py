@@ -163,7 +163,8 @@ class QSPIFlashController(wiring.Component):
 # Fast Read Quad Output (6Bh): the command and 24-bit address go out on a
 # single lane, then a dummy byte, then data returns on all four. Requires the
 # QE bit in status register 2, which on this board is already set.
-OPCODE_QUAD_READ = 0x6B
+OPCODE_QUAD_READ = 0x6B      # Fast Read Quad Output: address on one lane
+OPCODE_QUAD_IO_READ = 0xEB   # Fast Read Quad I/O: address on four lanes
 
 
 class QuadFlashReader(Elaboratable):
@@ -197,6 +198,16 @@ class QuadFlashReader(Elaboratable):
         self.start       = Signal()
         self.length      = Signal(16)
         self.divisor     = Signal(16)
+        # Select 0xEB (quad I/O) over 0x6B (quad output). Both return data on
+        # four lanes; 0xEB also sends the address on four, which halves the
+        # per-transaction overhead from 40 clocks to 20.
+        #
+        # That is worth little on a long streaming read -- 0.2% at 4 KiB -- and
+        # a great deal on small random ones: 19% for a 32-byte cache line, 28%
+        # for 16 bytes. The datasheet is explicit that it exists to allow
+        # "faster random access for code execution (XIP)", which is exactly the
+        # RISC-V-executing-from-flash case rather than the bulk-transfer one.
+        self.quad_io     = Signal()
         self.data_strobe = Signal()
         self.data        = Signal(8)
         self.cycles      = Signal(32)
@@ -209,10 +220,35 @@ class QuadFlashReader(Elaboratable):
         from glasgow.gateware.qspi import Operation
 
         # Opcode, three address bytes and one dummy byte, all single-lane.
-        header       = Array([OPCODE_QUAD_READ, 0x00, 0x00, 0x00, 0x00])
-        header_index = Signal(range(len(header)))
+        # 0x6B: opcode(x1) + 3 address bytes(x1) + 1 dummy byte(x1) = 5 beats.
+        # 0xEB: opcode(x1) + 3 address bytes(x4) + mode byte(x4) + 2 dummy
+        #       bytes(x4) = 7 beats, but each x4 beat is a quarter the clocks.
+        #
+        # The mode byte M7-0 is sent as zero: M5-4 must not be (1,0) or the
+        # device stays in Continuous Read Mode and expects the *next*
+        # transaction to omit its opcode -- which would desynchronise every
+        # following read.
+        header_1x    = Array([OPCODE_QUAD_READ, 0x00, 0x00, 0x00, 0x00])
+        header_4x    = Array([OPCODE_QUAD_IO_READ, 0x00, 0x00, 0x00,
+                              0x00, 0x00, 0x00])
+        header_len   = Signal(range(8))
+        header_index = Signal(range(8))
+        header_byte  = Signal(8)
+        header_oper  = Signal(3)
         bytes_left   = Signal(16)
         received     = Signal(16)
+
+        m.d.comb += header_len.eq(Mux(self.quad_io, len(header_4x),
+                                      len(header_1x)))
+        with m.If(self.quad_io):
+            m.d.comb += header_byte.eq(header_4x[header_index])
+            # Only the opcode goes out on a single lane; address, mode and
+            # dummy all use four.
+            m.d.comb += header_oper.eq(
+                Mux(header_index == 0, Operation.PutX1, Operation.PutX4))
+        with m.Else():
+            m.d.comb += header_byte.eq(header_1x[header_index])
+            m.d.comb += header_oper.eq(Operation.PutX1)
 
         m.d.comb += self.ctrl.divisor.eq(self.divisor)
 
@@ -233,12 +269,12 @@ class QuadFlashReader(Elaboratable):
                     self.busy                   .eq(1),
                     self.ctrl.i_stream.valid    .eq(1),
                     self.ctrl.i_stream.payload.chip.eq(1),
-                    self.ctrl.i_stream.payload.oper.eq(Operation.PutX1),
-                    self.ctrl.i_stream.payload.data.eq(header[header_index]),
+                    self.ctrl.i_stream.payload.oper.eq(header_oper),
+                    self.ctrl.i_stream.payload.data.eq(header_byte),
                 ]
                 m.d.sync += self.cycles.eq(self.cycles + 1)
                 with m.If(self.ctrl.i_stream.ready):
-                    with m.If(header_index == len(header) - 1):
+                    with m.If(header_index == header_len - 1):
                         m.next = "PAYLOAD"
                     with m.Else():
                         m.d.sync += header_index.eq(header_index + 1)
