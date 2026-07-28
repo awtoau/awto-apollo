@@ -29,7 +29,7 @@ by overriding the one method that builds it. That keeps all of Glasgow's timing
 and framing logic intact, which is the part worth reusing.
 """
 
-from amaranth import Elaboratable, Instance, Module, Signal
+from amaranth import Array, Elaboratable, Instance, Module, Mux, Signal
 from amaranth.lib import io, wiring
 
 from glasgow.gateware.ports import PortGroup
@@ -92,8 +92,18 @@ class QSPIFlashController(wiring.Component):
         self.sck      = Signal()
 
         self._sck_port = USRMCLKPort()
+
+        # Glasgow inverts CS itself (`cs=~ports.cs...` in its Controller),
+        # because it expects an active-high port. Our platform declares cs with
+        # PinsN, so the port already carries invert=True and the two cancel:
+        # CS is never asserted, the flash never responds, and every read comes
+        # back as zeros -- at the right speed, and identically for every sample
+        # offset, which is what made it look like a sampling problem.
+        cs_port = io.SingleEndedPort(resource.cs.io, invert=False,
+                                     direction=resource.cs.direction)
+
         self._inner = _GlasgowQSPIController(
-            PortGroup(cs=resource.cs,
+            PortGroup(cs=cs_port,
                       sck=self._sck_port,
                       io=resource.dq),
             offset=offset)
@@ -134,5 +144,122 @@ class QSPIFlashController(wiring.Component):
             i_USRMCLKI  = self.sck,
             i_USRMCLKTS = 0,
         )
+
+        return m
+
+
+# Fast Read Quad Output (6Bh): the command and 24-bit address go out on a
+# single lane, then a dummy byte, then data returns on all four. Requires the
+# QE bit in status register 2, which on this board is already set.
+OPCODE_QUAD_READ = 0x6B
+
+
+class QuadFlashReader(Elaboratable):
+    """ Reads a span of flash using Fast Read Quad Output.
+
+    Four bits per clock instead of one, so at a given SCK this is four times
+    the throughput of the 0x03 and 0x0B paths -- without raising SCK, which is
+    where the single-lane implementation ran out of margin.
+
+    Attributes
+    ----------
+    start : Signal(), in
+        Strobe to begin a read from address zero.
+    length : Signal(16), in
+        Number of bytes to read.
+    divisor : Signal(16), in
+        Passed to the controller; SCK is the sync rate over this.
+    data_strobe : Signal(), out
+        High for one cycle per returned byte.
+    data : Signal(8), out
+        That byte.
+    cycles : Signal(32), out
+        Sync-domain cycles the transfer occupied.
+    done : Signal(), out
+        High once the read has completed.
+    """
+
+    def __init__(self, *, controller):
+        self.ctrl = controller
+
+        self.start       = Signal()
+        self.length      = Signal(16)
+        self.divisor     = Signal(16)
+        self.data_strobe = Signal()
+        self.data        = Signal(8)
+        self.cycles      = Signal(32)
+        self.done        = Signal()
+        self.busy        = Signal()
+
+    def elaborate(self, platform):
+        m = Module()
+
+        from glasgow.gateware.qspi import Operation
+
+        # Opcode, three address bytes and one dummy byte, all single-lane.
+        header       = Array([OPCODE_QUAD_READ, 0x00, 0x00, 0x00, 0x00])
+        header_index = Signal(range(len(header)))
+        bytes_left   = Signal(16)
+        received     = Signal(16)
+
+        m.d.comb += self.ctrl.divisor.eq(self.divisor)
+
+        with m.FSM():
+            with m.State("IDLE"):
+                with m.If(self.start):
+                    m.d.sync += [
+                        header_index.eq(0),
+                        bytes_left  .eq(self.length),
+                        received    .eq(0),
+                        self.cycles .eq(0),
+                        self.done   .eq(0),
+                    ]
+                    m.next = "HEADER"
+
+            with m.State("HEADER"):
+                m.d.comb += [
+                    self.busy                   .eq(1),
+                    self.ctrl.i_stream.valid    .eq(1),
+                    self.ctrl.i_stream.payload.chip.eq(1),
+                    self.ctrl.i_stream.payload.oper.eq(Operation.PutX1),
+                    self.ctrl.i_stream.payload.data.eq(header[header_index]),
+                ]
+                m.d.sync += self.cycles.eq(self.cycles + 1)
+                with m.If(self.ctrl.i_stream.ready):
+                    with m.If(header_index == len(header) - 1):
+                        m.next = "PAYLOAD"
+                    with m.Else():
+                        m.d.sync += header_index.eq(header_index + 1)
+
+            with m.State("PAYLOAD"):
+                m.d.comb += [
+                    self.busy                   .eq(1),
+                    self.ctrl.i_stream.valid    .eq(bytes_left != 0),
+                    # chip 0 deselects, ending the transaction on the last byte
+                    self.ctrl.i_stream.payload.chip.eq(
+                        Mux(bytes_left == 0, 0, 1)),
+                    self.ctrl.i_stream.payload.oper.eq(Operation.GetX4),
+                    self.ctrl.i_stream.payload.data.eq(0),
+                    self.ctrl.o_stream.ready    .eq(1),
+                ]
+                m.d.sync += self.cycles.eq(self.cycles + 1)
+
+                with m.If(self.ctrl.i_stream.valid & self.ctrl.i_stream.ready):
+                    m.d.sync += bytes_left.eq(bytes_left - 1)
+
+                with m.If(self.ctrl.o_stream.valid):
+                    m.d.comb += [
+                        self.data_strobe.eq(1),
+                        self.data.eq(self.ctrl.o_stream.payload.data),
+                    ]
+                    m.d.sync += received.eq(received + 1)
+
+                # Wait until every requested byte has actually come back. The
+                # controller's pipeline is several cycles deep, so finishing
+                # when the last byte is *requested* drops the tail -- observed
+                # in simulation as 7 bytes returned for a length of 8.
+                with m.If(received == self.length):
+                    m.d.sync += self.done.eq(1)
+                    m.next = "IDLE"
 
         return m
