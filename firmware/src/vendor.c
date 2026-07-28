@@ -128,7 +128,7 @@ const uint8_t msft_10_ext_props[] = {
 /**
  * Request Microsoft Windows Compatible ID descriptor.
 */
-bool handle_get_ms_descriptor(uint8_t rhport, tusb_control_request_t const* request)
+static bool handle_get_ms_descriptor(uint8_t rhport, tusb_control_request_t const* request)
 {
 	if (request->wIndex == 0x0004) {
 		return tud_control_xfer(rhport, request, (void *)msft_10_compat_id, sizeof(msft_10_compat_id));
@@ -143,7 +143,7 @@ bool handle_get_ms_descriptor(uint8_t rhport, tusb_control_request_t const* requ
 /**
  * Simple request that's used to identify the running firmware; mostly a sanity check.
  */
-bool handle_get_id_request(uint8_t rhport, tusb_control_request_t const* request)
+static bool handle_get_id_request(uint8_t rhport, tusb_control_request_t const* request)
 {
 	static char description[] = "Apollo Debug Module";
 	return tud_control_xfer(rhport, request, description, sizeof(description));
@@ -153,7 +153,7 @@ bool handle_get_id_request(uint8_t rhport, tusb_control_request_t const* request
 /**
  * Request firmware version string.
  */
-bool handle_get_firmware_version_request(uint8_t rhport, tusb_control_request_t const* request)
+static bool handle_get_firmware_version_request(uint8_t rhport, tusb_control_request_t const* request)
 {
 	static char version[] = VERSION_STRING;
 	return tud_control_xfer(rhport, request, version, sizeof(version));
@@ -163,7 +163,7 @@ bool handle_get_firmware_version_request(uint8_t rhport, tusb_control_request_t 
 /**
  * Request USB API version.
  */
-bool handle_get_usb_api_version_request(uint8_t rhport, tusb_control_request_t const* request)
+static bool handle_get_usb_api_version_request(uint8_t rhport, tusb_control_request_t const* request)
 {
 	static char usb_api[2] = {USB_API_MAJOR, USB_API_MINOR};
 	return tud_control_xfer(rhport, request, usb_api, sizeof(usb_api));
@@ -173,7 +173,7 @@ bool handle_get_usb_api_version_request(uint8_t rhport, tusb_control_request_t c
 /**
  * Request raw ADC reading.
  */
-bool handle_get_adc_reading_request(uint8_t rhport, tusb_control_request_t const* request)
+static bool handle_get_adc_reading_request(uint8_t rhport, tusb_control_request_t const* request)
 {
 	static char buf[2];
 	uint16_t reading = get_adc_reading();
@@ -186,7 +186,7 @@ bool handle_get_adc_reading_request(uint8_t rhport, tusb_control_request_t const
 /**
  * Request that changes the active LED pattern.
  */
-bool handle_set_led_pattern(uint8_t rhport, tusb_control_request_t const* request)
+static bool handle_set_led_pattern(uint8_t rhport, tusb_control_request_t const* request)
 {
 	led_set_pattern(request->wValue);
 	return tud_control_xfer(rhport, request, NULL, 0);
@@ -196,7 +196,7 @@ bool handle_set_led_pattern(uint8_t rhport, tusb_control_request_t const* reques
 /**
  * Request that changes the active LED pattern.
  */
-bool handle_trigger_fpga_reconfiguration(uint8_t rhport, tusb_control_request_t const* request)
+static bool handle_trigger_fpga_reconfiguration(uint8_t rhport, tusb_control_request_t const* request)
 {
 	trigger_fpga_reconfiguration();
 	return tud_control_xfer(rhport, request, NULL, 0);
@@ -206,7 +206,7 @@ bool handle_trigger_fpga_reconfiguration(uint8_t rhport, tusb_control_request_t 
 /**
  * Request that forces the FPGA offline, preventing bricking.
  */
-bool handle_force_fpga_offline(uint8_t rhport, tusb_control_request_t const* request)
+static bool handle_force_fpga_offline(uint8_t rhport, tusb_control_request_t const* request)
 {
 	force_fpga_offline();
 	return tud_control_xfer(rhport, request, NULL, 0);
@@ -216,12 +216,12 @@ bool handle_force_fpga_offline(uint8_t rhport, tusb_control_request_t const* req
 /**
  * Request Apollo to allow FPGA takeover of the USB port.
  */
-bool handle_allow_fpga_takeover_usb(uint8_t rhport, tusb_control_request_t const* request)
+static bool handle_allow_fpga_takeover_usb(uint8_t rhport, tusb_control_request_t const* request)
 {
 	return tud_control_xfer(rhport, request, NULL, 0);
 }
 
-bool handle_allow_fpga_takeover_usb_finish(uint8_t rhport, tusb_control_request_t const* request)
+static bool handle_allow_fpga_takeover_usb_finish(uint8_t rhport, tusb_control_request_t const* request)
 {
 	allow_fpga_takeover_usb(true);
 	return true;
@@ -238,12 +238,12 @@ bool handle_allow_fpga_takeover_usb_finish(uint8_t rhport, tusb_control_request_
  * look like a USB failure. Acknowledging first gives the host a clean
  * completion, and only then do we go down.
  */
-bool handle_boot_to_dfu(uint8_t rhport, tusb_control_request_t const* request)
+static bool handle_boot_to_dfu(uint8_t rhport, tusb_control_request_t const* request)
 {
 	return tud_control_xfer(rhport, request, NULL, 0);
 }
 
-bool handle_boot_to_dfu_finish(uint8_t rhport, tusb_control_request_t const* request)
+static bool handle_boot_to_dfu_finish(uint8_t rhport, tusb_control_request_t const* request)
 {
 	// Does not return: arms the WDT and spins until the reset lands.
 	tud_dfu_runtime_reboot_to_dfu_cb();
@@ -346,7 +346,7 @@ static bool is_allowed_during_jtag_programming(uint8_t request)
  * Cancels JTAG ownership (releasing the pin lock via jtag_deinit()), drops the
  * USB takeover policy, and returns the control plane to HOLD.
  */
-bool handle_emergency_reset(uint8_t rhport, tusb_control_request_t const* request)
+static bool handle_emergency_reset(uint8_t rhport, tusb_control_request_t const* request)
 {
 	if (apollo_mode_jtag_active()) {
 		led_set_pattern(LED_IDLE);
