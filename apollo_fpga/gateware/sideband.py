@@ -190,7 +190,24 @@ class SidebandResponder(Elaboratable):
     """
 
     def __init__(self, clk_freq_hz=60e6, baud=115200, turnaround_us=40):
+        # The bit period is a cycle count fixed at build time, so this module is
+        # only correct if the domain it ends up in really runs at clk_freq_hz.
+        # Nothing checks that at elaboration: a design that raises its sync
+        # frequency and leaves this argument alone gets a link that is dead
+        # rather than degraded -- at 120 MHz the effective baud doubles, and a
+        # UART tolerates roughly +/-2%.
+        #
+        # Instantiate under DomainRenamer onto a domain pinned to this
+        # frequency when the rest of the design clocks faster; see the sideband
+        # test bitstream for the pattern.
+        self.clk_freq_hz = clk_freq_hz
+        self.baud = baud
         self.divisor = int(clk_freq_hz // baud)
+
+        if self.divisor < 8:
+            raise ValueError(
+                f"clock {clk_freq_hz/1e6:.1f} MHz is too slow for {baud} baud: "
+                f"divisor {self.divisor} leaves no room to sample mid-bit")
 
         # Turnaround is an ABSOLUTE time, not a multiple of the bit period.
         #
