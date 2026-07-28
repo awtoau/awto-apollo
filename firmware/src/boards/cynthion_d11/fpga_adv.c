@@ -331,9 +331,15 @@ uint8_t fpga_adv_command(uint8_t command, uint8_t *buffer, uint8_t length)
 	// Derived from the baud rate rather than hard-coded, so it stays correct
 	// if the rate changes. Ten character times per expected byte, plus a
 	// fixed allowance for the FPGA to turn the line around.
+	//
+	// Per-byte cost is folded to a compile-time constant (rounded up, so the
+	// deadline is never short) rather than dividing at runtime. `length` is a
+	// variable, so a runtime `/ ADV_UART_BAUD` would pull in __udivsi3 -- 266
+	// bytes of soft-division helper on this Cortex-M0+, for one division.
+	#define ADV_MS_PER_BYTE (((10UL * 10UL * 1000UL) + ADV_UART_BAUD - 1) \
+	                         / ADV_UART_BAUD)
 	const uint32_t deadline = board_millis()
-	                        + 1 + ((10UL * 10UL * (length + 2)) * 1000UL)
-	                              / ADV_UART_BAUD;
+	                        + 1 + (uint32_t)(length + 2) * ADV_MS_PER_BYTE;
 
 	while (response_len < response_want) {
 		if ((int32_t)(board_millis() - deadline) >= 0) {

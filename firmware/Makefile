@@ -74,6 +74,17 @@ CFLAGS += \
 	-D VERSION_STRING=\"$(VERSION_STRING)\" \
 	-g
 
+# Link-time optimisation. The SAMD11D14's 14 KB of application flash (16 KB
+# less the 2 KB Saturn-V bootloader) is the binding constraint on this board,
+# and cross-translation-unit inlining plus whole-program dead-code elimination
+# is the single largest saving available without deleting features.
+#
+# -flto-partition=one keeps the whole program in one partition: with the
+# default balanced partitioning GCC cannot inline across partition boundaries,
+# which on a program this small costs most of the benefit.
+CFLAGS  += -flto=auto -flto-partition=one
+LDFLAGS += -flto=auto -flto-partition=one -Wl,--entry=Reset_Handler -Wl,-u,exception_table
+
 INC += \
 	src \
 	src/boards/$(BOARD) \

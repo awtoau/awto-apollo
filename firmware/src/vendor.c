@@ -241,13 +241,29 @@ static bool handle_allow_fpga_takeover_usb_finish(uint8_t rhport, tusb_control_r
  * fpga_adv_set_mode() only re-muxes a pin and reconfigures a peripheral -- it
  * returns normally, unlike the DFU reboot which cannot.
  */
-bool handle_fpga_adv_mode(uint8_t rhport, tusb_control_request_t const* request)
+static bool handle_fpga_adv_mode(uint8_t rhport, tusb_control_request_t const* request)
 {
 	static uint8_t mode;
 
 	if (request->wValue == 0xFFFF) {
 		mode = (uint8_t)fpga_adv_get_mode();
 		return tud_control_xfer(rhport, request, &mode, sizeof(mode));
+	}
+
+	// wValue 0xFFFE issues a sideband command: wIndex low byte is the command,
+	// high byte the expected response length. Folded into this request rather
+	// than given its own opcode -- same subsystem, and one dispatch case is
+	// cheaper than a second handler.
+	if (request->wValue == 0xFFFE) {
+		static uint8_t reply[18];
+		uint8_t want = (request->wIndex >> 8) & 0xFF;
+		if (want > sizeof(reply)) {
+			return false;
+		}
+		uint8_t got = fpga_adv_command((uint8_t)request->wIndex, reply, want);
+		// A short reply means timeout; return what arrived so the host can
+		// tell "nothing" from "partial" -- an absent FPGA from a broken link.
+		return tud_control_xfer(rhport, request, reply, got);
 	}
 
 	if (!fpga_adv_set_mode((fpga_adv_mode_t)request->wValue)) {
