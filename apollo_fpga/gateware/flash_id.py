@@ -20,6 +20,8 @@ precisely the detail the LUNA block exists to hide.
 
 from amaranth import Elaboratable, Module, Mux, Signal
 
+from luna.gateware.stream import StreamInterface
+
 
 # Winbond/JEDEC opcodes. 0x9F is the one command every SPI-NOR part answers the
 # same way, which is why identification uses it rather than anything vendor
@@ -27,6 +29,58 @@ from amaranth import Elaboratable, Module, Mux, Signal
 OPCODE_JEDEC_ID  = 0x9F
 OPCODE_READ      = 0x03   # up to 50 MHz on the W25Q32DV
 OPCODE_FAST_READ = 0x0B   # up to 104 MHz, one dummy byte after the address
+
+
+class SPIPort:
+    """ One requester's private view of the SPI controller's streams.
+
+    Each block drives its own port and a mux grants the real controller to
+    whichever is active. Without this both blocks drive the controller's input
+    stream directly and Amaranth rejects the design with a DriverConflict --
+    correctly, since combinational drivers would otherwise be merged into
+    nonsense.
+    """
+
+    def __init__(self):
+        self.input  = StreamInterface()
+        self.output = StreamInterface()
+
+
+class SPIMux(Elaboratable):
+    """ Grants a shared SPIStreamController to one of several ports.
+
+    Ownership here is strictly sequential -- the ID read completes before the
+    throughput measurement begins -- so this is a selector rather than an
+    arbiter: it does not queue, and a request made while another port holds the
+    bus is simply not connected. Two blocks that genuinely overlapped would
+    need real arbitration.
+    """
+
+    def __init__(self, *, controller, ports):
+        self.controller = controller
+        self.ports      = list(ports)
+        self.select     = Signal(range(max(len(self.ports), 2)))
+
+    def elaborate(self, platform):
+        m = Module()
+
+        ctrl = self.controller
+        with m.Switch(self.select):
+            for index, port in enumerate(self.ports):
+                with m.Case(index):
+                    m.d.comb += [
+                        ctrl.input.valid   .eq(port.input.valid),
+                        ctrl.input.payload .eq(port.input.payload),
+                        ctrl.input.last    .eq(port.input.last),
+                        port.input.ready   .eq(ctrl.input.ready),
+
+                        port.output.valid  .eq(ctrl.output.valid),
+                        port.output.payload.eq(ctrl.output.payload),
+                        port.output.last   .eq(ctrl.output.last),
+                        ctrl.output.ready  .eq(port.output.ready),
+                    ]
+
+        return m
 
 
 class FlashIDReader(Elaboratable):
@@ -50,8 +104,8 @@ class FlashIDReader(Elaboratable):
         High once a read has completed.
     """
 
-    def __init__(self, *, spi_controller):
-        self.spi = spi_controller
+    def __init__(self):
+        self.spi = SPIPort()
 
         self.start        = Signal()
         self.manufacturer = Signal(8)
@@ -155,8 +209,8 @@ class FlashSpeedTest(Elaboratable):
         High once a measurement has completed.
     """
 
-    def __init__(self, *, spi_controller):
-        self.spi = spi_controller
+    def __init__(self):
+        self.spi = SPIPort()
 
         self.start     = Signal()
         self.length    = Signal(16)
