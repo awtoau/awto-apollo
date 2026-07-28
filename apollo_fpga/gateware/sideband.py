@@ -30,6 +30,7 @@ from amaranth_stdio.serial import AsyncSerialRX
 CMD_PING   = 0x01
 CMD_STATUS = 0x02
 CMD_POWER  = 0x2B
+CMD_DEVICES = 0x2C   # flash JEDEC ID + HyperRAM presence
 
 # LED control occupies 0x40-0x7F: the low six bits are the pattern, so the
 # whole command fits in the single opcode byte and the protocol stays
@@ -42,6 +43,7 @@ PAYLOAD_SIZE = {
     CMD_PING:   2,
     CMD_STATUS: 0,
     CMD_POWER:  16,
+    CMD_DEVICES: 4,   # flash manufacturer, type, capacity, then a flags byte
 }
 
 # Status byte bits.
@@ -248,6 +250,15 @@ class SidebandResponder(Elaboratable):
         self.led_pattern  = Signal(6)
         self.led_override = Signal()
 
+        # Device identification, driven by FlashIDReader and the HyperRAM
+        # block. Sampled when a DEVICES command arrives rather than being
+        # buffered here, since none of it changes while powered.
+        self.flash_manufacturer = Signal(8)
+        self.flash_memory_type  = Signal(8)
+        self.flash_capacity     = Signal(8)
+        self.flash_valid        = Signal()
+        self.hyperram_present   = Signal()
+
     def elaborate(self, platform):
         m = Module()
 
@@ -336,6 +347,18 @@ class SidebandResponder(Elaboratable):
         # PING's payload; POWER's comes from power_data.
         ping_payload = Array([Const(PROTOCOL_VERSION, 8), Const(0x00, 8)])
 
+        # Flash JEDEC ID, then a flags byte. The flags carry presence rather
+        # than identity: HyperRAM has no JEDEC ID to read, so the only useful
+        # thing to report is whether it answered at all.
+        device_flags = Signal(8)
+        m.d.comb += device_flags.eq(Cat(self.hyperram_present,
+                                        self.flash_valid,
+                                        Const(0, 6)))
+        devices_payload = Array([self.flash_manufacturer,
+                                 self.flash_memory_type,
+                                 self.flash_capacity,
+                                 device_flags])
+
         # send_byte is registered, not combinational: UARTTx latches .data in
         # its LOAD state, one cycle after .start is asserted. A combinational
         # value would have returned to its default by then, which transmitted
@@ -379,6 +402,13 @@ class SidebandResponder(Elaboratable):
                             m.d.sync += [ok.eq(1),
                                          payload_len.eq(PAYLOAD_SIZE[CMD_POWER]),
                                          last_power.eq(1), unknown_cmd.eq(0)]
+                        with m.Case(CMD_DEVICES):
+                            # OK reflects whether the flash ID has actually been
+                            # read, so a host cannot mistake the power-on zeros
+                            # for a device that answered with zeros.
+                            m.d.sync += [ok.eq(self.flash_valid),
+                                         payload_len.eq(PAYLOAD_SIZE[CMD_DEVICES]),
+                                         last_power.eq(0), unknown_cmd.eq(0)]
                         with m.Default():
                             # LED control: 0x40-0x7F, pattern in the low six
                             # bits. Ranged rather than enumerated so all 64
@@ -455,6 +485,9 @@ class SidebandResponder(Elaboratable):
                     with m.If(command == CMD_POWER):
                         m.d.comb += selected.eq(
                             self.power_data.word_select(byte_index[:4], 8))
+                    with m.Elif(command == CMD_DEVICES):
+                        m.d.comb += selected.eq(
+                            devices_payload[byte_index[:2]])
                     with m.Else():
                         m.d.comb += selected.eq(ping_payload[byte_index[:1]])
 

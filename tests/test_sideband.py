@@ -23,7 +23,7 @@ from amaranth.hdl import Module, Signal
 from amaranth.sim import Simulator
 
 from apollo_fpga.gateware.sideband import (
-    SidebandResponder, CMD_PING, CMD_STATUS, CMD_POWER,
+    SidebandResponder, CMD_PING, CMD_STATUS, CMD_POWER, CMD_DEVICES,
     STATUS_OK, STATUS_HEARTBEAT, STATUS_EVENTS, PROTOCOL_VERSION,
     CMD_LED_BASE,
 )
@@ -151,6 +151,35 @@ class SidebandTest(unittest.TestCase):
         self.assertEqual(payload, expected,
                          "payload bytes do not match the input, little-endian")
         self.assertEqual(crc, crc8([status] + payload), "CRC mismatch")
+
+    def test_devices_returns_flash_id(self):
+        """DEVICES carries the JEDEC ID and a presence-flags byte."""
+        response = self._run(CMD_DEVICES,
+                             flash_manufacturer=0xEF,   # Winbond
+                             flash_memory_type=0x40,
+                             flash_capacity=0x16,       # 4 MiB
+                             flash_valid=1,
+                             hyperram_present=1)
+        self.assertEqual(len(response), 6,
+                         f"expected 6 bytes, got {len(response)}")
+
+        status, payload, crc = response[0], response[1:5], response[5]
+        self.assertTrue(status & (1 << STATUS_OK))
+        self.assertEqual(payload[:3], [0xEF, 0x40, 0x16],
+                         "JEDEC ID bytes are out of order or wrong")
+        self.assertEqual(payload[3], 0b11, "both presence flags should be set")
+        self.assertEqual(crc, crc8([status] + payload), "CRC mismatch")
+
+    def test_devices_clears_ok_before_flash_read(self):
+        """Until the flash has answered, DEVICES must report OK clear.
+
+        Otherwise the power-on zeros are indistinguishable from a device that
+        genuinely identified itself as 00 00 00.
+        """
+        response = self._run(CMD_DEVICES, flash_valid=0)
+        status = response[0]
+        self.assertFalse(status & (1 << STATUS_OK),
+                         "OK must be clear while the flash ID is unread")
 
     def test_unknown_command_clears_ok(self):
         """An unrecognised command must still answer, with OK clear.
