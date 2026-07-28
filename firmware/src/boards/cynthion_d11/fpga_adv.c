@@ -61,11 +61,21 @@ static volatile uint32_t last_heartbeat = 0;
 // single bit error, and one dropped frame should not surrender the port.
 #define HEARTBEAT_TIMEOUT_MS 300UL
 
-// 115200 matches the FPGA responder. Software transmit is bit-banged from a
+// 230400 matches the FPGA responder.
+//
+// Measured better than 115200 on r1.4, which is counter-intuitive but has a
+// clear cause: transmit is bit-banged, so a byte occupies the CPU for 10 bit
+// periods. At 115200 that is 86.8 us, at 230400 only 43.4 us -- halving the
+// window in which a USB interrupt can preempt a bit and stretch it past the
+// receiver's sample point. 100/100 at 230400 against 97/100 at 115200.
+//
+// 460800 fails hard (1/100, with real CRC corruption rather than timeouts):
+// 104 CPU cycles per bit leaves nothing once M0+ ISR entry and exit are
+// subtracted. Software transmit is bit-banged from a
 // timer interrupt; at 115200 a bit is 8.68 us, so a USB ISR preempting one
 // still leaves the receiver sampling mid-bit. At 1 Mbaud (1 us bits) that
 // margin is gone, which is why the command protocol runs at the lower rate.
-#define ADV_UART_BAUD 115200UL
+#define ADV_UART_BAUD 230400UL
 
 //
 // Transmit state, shared between the foreground and TC1_Handler.
@@ -95,6 +105,13 @@ static volatile uint8_t  tx_bits_left = 0;
 static volatile uint8_t  response[ADV_RESPONSE_MAX];
 static volatile uint8_t  response_len = 0;
 static volatile uint8_t  response_want = 0;
+
+// Link health, reported to the host so corruption is visible rather than
+// silent. Saturating rather than wrapping: a count stuck at 255 still says
+// "this link is bad", where a wrapped counter can read as healthy.
+static uint8_t stat_ok      = 0;   // responses that arrived with a valid CRC
+static uint8_t stat_crc     = 0;   // arrived complete, CRC did not match
+static uint8_t stat_timeout = 0;   // did not arrive at all
 
 #endif
 
@@ -321,6 +338,21 @@ static void fpga_adv_tx_byte(uint8_t byte)
 uint8_t fpga_adv_command(uint8_t command, uint8_t *buffer, uint8_t length)
 {
 #ifdef BOARD_HAS_USB_SWITCH
+	// Refuse before the FPGA has configured.
+	//
+	// Until DONE goes high the FPGA's I/O are tri-stated, so FPGA_ADV floats,
+	// held only by our pull-up. There is no responder to answer, and a
+	// floating CMOS input can pick up noise the receiver frames as spurious
+	// start bits. Returning 0 is honest -- the link does not exist yet -- and
+	// distinguishes "FPGA not ready" from "FPGA did not reply", which a
+	// timeout alone cannot.
+	//
+	// Checked here, before anything is armed: the GPIO accesses it performs
+	// are latency on a transmit path whose turnaround is already tight.
+	if (!fpga_configuration_done()) {
+		return 0;
+	}
+
 	if (adv_mode != FPGA_ADV_MODE_UART || length > ADV_RESPONSE_MAX) {
 		return 0;
 	}
@@ -361,6 +393,7 @@ uint8_t fpga_adv_command(uint8_t command, uint8_t *buffer, uint8_t length)
 	while (response_len < response_want) {
 		if ((int32_t)(board_millis() - deadline) >= 0) {
 			response_want = 0;
+			if (stat_timeout < 255) stat_timeout++;
 			return 0;
 		}
 	}
@@ -369,6 +402,17 @@ uint8_t fpga_adv_command(uint8_t command, uint8_t *buffer, uint8_t length)
 	for (uint8_t i = 0; i < length; i++) {
 		buffer[i] = response[i];
 	}
+
+	// Verify here rather than leaving it to the host: a corrupted payload is
+	// otherwise indistinguishable from a good one, and the whole point of
+	// carrying a CRC is that nothing downstream has to trust the wire. The
+	// bytes are still returned so the caller can inspect what arrived.
+	if (length >= 2 && fpga_adv_crc8(buffer, length - 1) != buffer[length - 1]) {
+		if (stat_crc < 255) stat_crc++;
+	} else {
+		if (stat_ok < 255) stat_ok++;
+	}
+
 	return length;
 #else
 	(void)command; (void)buffer; (void)length;
@@ -394,6 +438,41 @@ uint8_t fpga_adv_crc8(const uint8_t *data, uint8_t length)
 		}
 	}
 	return crc;
+}
+
+/**
+ * Report link health: responses OK, CRC failures, timeouts.
+ *
+ * Counters saturate at 255 and are cleared by reading, so successive reads
+ * give the count since the last look rather than an ever-growing total.
+ */
+void fpga_adv_get_stats(uint8_t *ok, uint8_t *crc_fail, uint8_t *timeout)
+{
+#ifdef BOARD_HAS_USB_SWITCH
+	*ok = stat_ok; *crc_fail = stat_crc; *timeout = stat_timeout;
+	stat_ok = stat_crc = stat_timeout = 0;
+#else
+	*ok = *crc_fail = *timeout = 0;
+#endif
+}
+
+/**
+ * True once the FPGA has completed configuration.
+ *
+ * DONE is driven by the FPGA and read-only here, so this cannot disturb
+ * configuration. Note it latches: it goes high at first configuration and
+ * stays high across force-offline, so it answers "has the FPGA configured
+ * since power-up" rather than "is the FPGA running right now".
+ */
+bool fpga_configuration_done(void)
+{
+#ifdef BOARD_HAS_USB_SWITCH
+	gpio_set_pin_direction(FPGA_DONE, GPIO_DIRECTION_IN);
+	gpio_set_pin_pull_mode(FPGA_DONE, GPIO_PULL_OFF);
+	return gpio_get_pin_level(FPGA_DONE);
+#else
+	return true;
+#endif
 }
 
 /**

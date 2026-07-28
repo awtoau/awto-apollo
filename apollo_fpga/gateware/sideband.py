@@ -31,6 +31,12 @@ CMD_PING   = 0x01
 CMD_STATUS = 0x02
 CMD_POWER  = 0x2B
 
+# LED control occupies 0x40-0x7F: the low six bits are the pattern, so the
+# whole command fits in the single opcode byte and the protocol stays
+# stateless. 0x40 turns them all off, 0x7F turns them all on.
+CMD_LED_BASE = 0x40
+CMD_LED_MASK = 0x3F
+
 # Response payload sizes, excluding the status byte and the CRC.
 PAYLOAD_SIZE = {
     CMD_PING:   2,
@@ -181,14 +187,38 @@ class SidebandResponder(Elaboratable):
         I: state        -- 2-bit FPGA state
     """
 
-    def __init__(self, clk_freq_hz=60e6, baud=115200):
+    def __init__(self, clk_freq_hz=60e6, baud=115200, turnaround_us=40):
         self.divisor = int(clk_freq_hz // baud)
+
+        # Turnaround is an ABSOLUTE time, not a multiple of the bit period.
+        #
+        # Measured on r1.4 at 115200: 20 us fails (the master's stop bit is
+        # still on the wire when the receiver re-arms, so the tail of the
+        # previous frame is taken as a start bit and the next byte reads one
+        # bit position late -- 0x02 framed as 0x80). 25 us and above pass
+        # 20/20. The default is 40 us, twice the observed failure point, so the
+        # margin does not depend on a boundary measured on one board.
+        #
+        # The master's handover cost is fixed in CPU cycles -- Apollo bit-bangs
+        # its transmit from a timer ISR and only returns the pin to its SERCOM
+        # one bit period after the stop bit, then the SERCOM must resync. None
+        # of that shrinks as the baud rises. Scaling the delay with the bit
+        # period therefore starved it exactly when it was needed most: 100% at
+        # 115200, 92% at 230400, 0% above.
+        self.turnaround_cycles = max(int(clk_freq_hz * turnaround_us / 1e6), 1)
 
         self.rx           = Signal(init=1)
         self.tx           = Signal(init=1)
         self.tx_active    = Signal()
 
         self.power_data   = Signal(128)
+
+        # Momentary inputs, latched. A button press between two polls would be
+        # missed entirely if the master only ever saw the live level, so an
+        # edge sets a sticky bit that survives until the master has actually
+        # seen it.
+        self.button       = Signal()
+
         self.events       = Signal()
         self.error        = Signal()
         self.reconfigured = Signal()
@@ -211,6 +241,12 @@ class SidebandResponder(Elaboratable):
         # command" -- the responder's own state only reflects bytes it accepted.
         self.rx_strobe = Signal()
         self.rx_byte   = Signal(8)
+
+        # Host-commanded LED pattern. led_override latches on the first LED
+        # command so the display does not flicker back to its default state
+        # between commands.
+        self.led_pattern  = Signal(6)
+        self.led_override = Signal()
 
     def elaborate(self, platform):
         m = Module()
@@ -242,6 +278,25 @@ class SidebandResponder(Elaboratable):
         heartbeat = Signal()
 
         #
+        # Button latch, read-and-clear.
+        #
+        # Set on a rising edge of self.button, reported in the status byte, and
+        # cleared only once a response carrying it has been fully transmitted.
+        # Clearing on receipt of the command instead would lose the press if
+        # the reply were then lost -- the master would never learn of it.
+        #
+        # A press arriving mid-response sets the latch again rather than being
+        # swallowed, since the set takes priority over the clear below.
+        #
+        button_latch = Signal()
+        button_prev  = Signal()
+        button_seen  = Signal()   # this response is reporting the latch
+
+        m.d.sync += button_prev.eq(self.button)
+        with m.If(self.button & ~button_prev):
+            m.d.sync += button_latch.eq(1)
+
+        #
         # Status LEDs.
         #
         # A received byte lasts one clock, which is invisible. Stretch it to
@@ -263,7 +318,7 @@ class SidebandResponder(Elaboratable):
         ok     = Signal()
         m.d.comb += status.eq(Cat(
             ok,                 # bit 0
-            self.events,        # bit 1
+            self.events | button_latch,   # bit 1: events, incl. button press
             self.error,         # bit 2
             self.reconfigured,  # bit 3
             self.state,         # bits 4-5
@@ -273,7 +328,7 @@ class SidebandResponder(Elaboratable):
 
         # Payload bytes for the command in flight. Sized for the largest
         # response so one register file serves all commands.
-        turnaround  = Signal(range(self.divisor * 2 + 1))
+        turnaround  = Signal(range(self.turnaround_cycles + 1))
         payload_len = Signal(range(17))
         byte_index  = Signal(range(19))
         send_byte   = Signal(8)
@@ -325,17 +380,34 @@ class SidebandResponder(Elaboratable):
                                          payload_len.eq(PAYLOAD_SIZE[CMD_POWER]),
                                          last_power.eq(1), unknown_cmd.eq(0)]
                         with m.Default():
-                            # Unknown command: status alone, OK clear. The
-                            # master still gets a well-formed reply rather than
-                            # a timeout, so it can tell "not understood" from
-                            # "not there".
-                            m.d.sync += [ok.eq(0), payload_len.eq(0),
-                                         unknown_cmd.eq(1)]
+                            # LED control: 0x40-0x7F, pattern in the low six
+                            # bits. Ranged rather than enumerated so all 64
+                            # patterns are one case.
+                            with m.If((rx_uart.data & ~CMD_LED_MASK)
+                                      == CMD_LED_BASE):
+                                m.d.sync += [
+                                    ok.eq(1), payload_len.eq(0),
+                                    last_power.eq(0), unknown_cmd.eq(0),
+                                    self.led_override.eq(1),
+                                    self.led_pattern.eq(
+                                        rx_uart.data & CMD_LED_MASK),
+                                ]
+                            with m.Else():
+                                # Unknown command: status alone, OK clear. The
+                                # master still gets a well-formed reply rather
+                                # than a timeout, so it can tell "not
+                                # understood" from "not there".
+                                m.d.sync += [ok.eq(0), payload_len.eq(0),
+                                             unknown_cmd.eq(1)]
 
-                    m.d.sync += [byte_index.eq(0), turnaround.eq(self.divisor * 2)]
+                    m.d.sync += [byte_index.eq(0),
+                                 turnaround.eq(self.turnaround_cycles),
+                                 # Remember whether this reply will carry the
+                                 # latch, so it is cleared only if it did.
+                                 button_seen.eq(button_latch)]
                     m.next = "TURNAROUND"
 
-            # Wait two bit periods before replying.
+            # Wait a fixed turnaround time before replying.
             #
             # The receiver frames a byte at the MIDDLE of its stop bit, but the
             # master needs until the END of that bit -- plus its own handover
@@ -418,6 +490,11 @@ class SidebandResponder(Elaboratable):
                 m.d.comb += self.tx_active.eq(1)
                 with m.If(~tx_uart.busy):
                     m.d.sync += [heartbeat.eq(~heartbeat), last_ok.eq(ok)]
+                    # Clear only what this response actually reported. A press
+                    # that arrived while transmitting keeps its latch set,
+                    # because the set above wins over this clear.
+                    with m.If(button_seen):
+                        m.d.sync += [button_latch.eq(0), button_seen.eq(0)]
                     m.next = "IDLE"
 
         return m

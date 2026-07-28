@@ -24,7 +24,8 @@ from amaranth.sim import Simulator
 
 from apollo_fpga.gateware.sideband import (
     SidebandResponder, CMD_PING, CMD_STATUS, CMD_POWER,
-    STATUS_OK, STATUS_HEARTBEAT, PROTOCOL_VERSION,
+    STATUS_OK, STATUS_HEARTBEAT, STATUS_EVENTS, PROTOCOL_VERSION,
+    CMD_LED_BASE,
 )
 
 
@@ -157,7 +158,9 @@ class SidebandTest(unittest.TestCase):
         A well-formed rejection lets the master distinguish 'not understood'
         from 'not there' -- a timeout cannot.
         """
-        response = self._run(0x7E)
+        # 0xF0 is outside every allocated range: not PING/STATUS/POWER,
+        # and not in the 0x40-0x7F LED block.
+        response = self._run(0xF0)
         self.assertEqual(len(response), 2,
                          f"expected 2 bytes, got {[hex(b) for b in response]}")
         status, crc = response
@@ -276,6 +279,105 @@ class SidebandTest(unittest.TestCase):
                         "the POWER-command LED never lit")
         self.assertFalse(any(v & 0b100000 for v in seen),
                          "the unknown-command LED lit for a valid command")
+
+    def test_led_command_sets_the_pattern(self):
+        """An LED command must latch its pattern and acknowledge.
+
+        The pattern lives in the low six bits of the opcode, so the whole
+        command fits in one byte and the protocol stays stateless.
+        """
+        for pattern in (0b000000, 0b101010, 0b111111):
+            dut = SidebandResponder(clk_freq_hz=CLK_HZ, baud=BAUD)
+            m = Module()
+            m.submodules.dut = dut
+            sim = Simulator(m)
+            sim.add_clock(1 / CLK_HZ)
+            captured = []
+            seen = []
+
+            async def drive(ctx, p=pattern):
+                ctx.set(dut.rx, 1)
+                for _ in range(DIVISOR * 2):
+                    await ctx.tick()
+                    captured.append(ctx.get(dut.tx))
+                command = CMD_LED_BASE | p
+                for bit in [0] + [(command >> i) & 1 for i in range(8)] + [1]:
+                    ctx.set(dut.rx, bit)
+                    for _ in range(DIVISOR):
+                        await ctx.tick()
+                        captured.append(ctx.get(dut.tx))
+                ctx.set(dut.rx, 1)
+                for _ in range(DIVISOR * 10 * 12):
+                    await ctx.tick()
+                    captured.append(ctx.get(dut.tx))
+                    seen.append((ctx.get(dut.led_override),
+                                 ctx.get(dut.led_pattern)))
+
+            sim.add_testbench(drive)
+            sim.run()
+
+            response = self._decode(captured)
+            self.assertEqual(len(response), 2,
+                             f"pattern {pattern:06b}: expected a 2-byte ack")
+            self.assertTrue(response[0] & (1 << STATUS_OK),
+                            f"pattern {pattern:06b}: OK bit not set")
+            self.assertTrue(any(o and v == pattern for o, v in seen),
+                            f"pattern {pattern:06b} was never latched")
+
+    def test_button_press_latches_until_reported(self):
+        """A momentary press must survive until the master has seen it.
+
+        Without a latch a press landing between two polls is lost entirely.
+        The latch clears only after a response carrying it has been fully
+        transmitted, so a press is not dropped when a reply goes missing.
+        """
+        dut = SidebandResponder(clk_freq_hz=CLK_HZ, baud=BAUD)
+        m = Module()
+        m.submodules.dut = dut
+        sim = Simulator(m)
+        sim.add_clock(1 / CLK_HZ)
+        captured = []
+
+        async def drive(ctx):
+            ctx.set(dut.rx, 1)
+            ctx.set(dut.button, 0)
+            for _ in range(DIVISOR):
+                await ctx.tick()
+                captured.append(ctx.get(dut.tx))
+
+            # A brief press, well before any command arrives.
+            ctx.set(dut.button, 1)
+            for _ in range(DIVISOR // 2):
+                await ctx.tick()
+                captured.append(ctx.get(dut.tx))
+            ctx.set(dut.button, 0)
+            for _ in range(DIVISOR):
+                await ctx.tick()
+                captured.append(ctx.get(dut.tx))
+
+            # Two STATUS polls: the first should report it, the second not.
+            for _ in range(2):
+                for bit in [0] + [(CMD_STATUS >> i) & 1 for i in range(8)] + [1]:
+                    ctx.set(dut.rx, bit)
+                    for _ in range(DIVISOR):
+                        await ctx.tick()
+                        captured.append(ctx.get(dut.tx))
+                ctx.set(dut.rx, 1)
+                for _ in range(DIVISOR * 10 * 8):
+                    await ctx.tick()
+                    captured.append(ctx.get(dut.tx))
+
+        sim.add_testbench(drive)
+        sim.run()
+
+        responses = self._decode(captured)
+        self.assertGreaterEqual(len(responses), 4,
+                                "expected two 2-byte responses")
+        first, second = responses[0], responses[2]
+        self.assertTrue(first & (1 << STATUS_EVENTS),
+                        "the press was not reported in the first poll")
+        self.assertFalse(second & (1 << STATUS_EVENTS),
+                         "the latch did not clear after being reported")
 
     def test_tx_active_is_low_when_idle(self):
         """tx_active drives the tri-state; asserting it while idle would hold

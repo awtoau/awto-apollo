@@ -56,6 +56,7 @@ enum {
 	VENDOR_REQUEST_FORCE_FPGA_OFFLINE      = 0xc1,
 	VENDOR_REQUEST_ALLOW_FPGA_TAKEOVER_USB = 0xc2,
 	VENDOR_REQUEST_FPGA_ADV_MODE           = 0xc3,
+	VENDOR_REQUEST_GET_FPGA_STATUS_PINS    = 0xc4,
 	VENDOR_REQUEST_BOOT_TO_DFU             = 0xed,
 
 
@@ -174,6 +175,39 @@ static bool handle_get_usb_api_version_request(uint8_t rhport, tusb_control_requ
 /**
  * Request raw ADC reading.
  */
+/**
+ * Read the FPGA configuration status pins.
+ *
+ * DONE and INITN are driven by the FPGA; Apollo only reads them here, so this
+ * cannot disturb configuration. FPGA_PROGRAM is deliberately NOT included: it
+ * is an FPGA input and any falling edge triggers reconfiguration.
+ *
+ * Lattice calls DONE/INITN "dedicated" pins, but that constrains what the
+ * ECP5 may do with its end -- Apollo's end is ordinary GPIO and reading it
+ * costs nothing. Whether DONE actually reflects configuration state on this
+ * board is exactly what this request exists to establish.
+ *
+ * Returns one byte: bit 0 = DONE, bit 1 = INITN.
+ */
+static bool handle_get_fpga_status_pins(uint8_t rhport, tusb_control_request_t const* request)
+{
+	static uint8_t state;
+
+	// Read-only: configure as inputs without pulls, so we observe what the
+	// FPGA drives rather than what we impose. INITN is open-drain on the FPGA
+	// side, so a pull here would mask a released line.
+	gpio_set_pin_direction(FPGA_DONE, GPIO_DIRECTION_IN);
+	gpio_set_pin_pull_mode(FPGA_DONE, GPIO_PULL_OFF);
+	gpio_set_pin_direction(FPGA_INITN, GPIO_DIRECTION_IN);
+	gpio_set_pin_pull_mode(FPGA_INITN, GPIO_PULL_OFF);
+
+	state = (gpio_get_pin_level(FPGA_DONE)  ? 1 : 0)
+	      | (gpio_get_pin_level(FPGA_INITN) ? 2 : 0);
+
+	return tud_control_xfer(rhport, request, &state, sizeof(state));
+}
+
+
 static bool handle_get_adc_reading_request(uint8_t rhport, tusb_control_request_t const* request)
 {
 	static char buf[2];
@@ -254,6 +288,15 @@ static bool handle_fpga_adv_mode(uint8_t rhport, tusb_control_request_t const* r
 	// high byte the expected response length. Folded into this request rather
 	// than given its own opcode -- same subsystem, and one dispatch case is
 	// cheaper than a second handler.
+	// wValue 0xFFFC reports link health: [ok, crc_fail, timeout], each
+	// saturating at 255 and cleared by this read. Without it a corrupted
+	// response is indistinguishable from a good one at the host.
+	if (request->wValue == 0xFFFC) {
+		static uint8_t stats[3];
+		fpga_adv_get_stats(&stats[0], &stats[1], &stats[2]);
+		return tud_control_xfer(rhport, request, stats, sizeof(stats));
+	}
+
 	// wValue 0xFFFD toggles the diagnostic square wave: wIndex 1 on, 0 off.
 	if (request->wValue == 0xFFFD) {
 		fpga_adv_set_toggle(request->wIndex != 0);
@@ -448,6 +491,8 @@ static bool handle_vendor_request_setup(uint8_t rhport, tusb_control_request_t c
 			return handle_allow_fpga_takeover_usb(rhport, request);
 		case VENDOR_REQUEST_FPGA_ADV_MODE:
 			return handle_fpga_adv_mode(rhport, request);
+		case VENDOR_REQUEST_GET_FPGA_STATUS_PINS:
+			return handle_get_fpga_status_pins(rhport, request);
 		case VENDOR_REQUEST_BOOT_TO_DFU:
 			return handle_boot_to_dfu(rhport, request);
 
