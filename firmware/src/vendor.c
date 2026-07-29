@@ -50,6 +50,7 @@ enum {
 	VENDOR_REQUEST_JTAG_GOTO_STATE         = 0xb5,
 	VENDOR_REQUEST_JTAG_GET_STATE          = 0xb6,
 	VENDOR_REQUEST_JTAG_BULK_SCAN          = 0xb7,
+	VENDOR_REQUEST_JTAG_BENCHMARK          = 0xb8,
 
 	// General programming requests.
 	VENDOR_REQUEST_TRIGGER_RECONFIGURATION = 0xc0,
@@ -323,6 +324,7 @@ static bool is_jtag_request(uint8_t request)
 		case VENDOR_REQUEST_JTAG_GOTO_STATE:
 		case VENDOR_REQUEST_JTAG_GET_STATE:
 		case VENDOR_REQUEST_JTAG_BULK_SCAN:
+		case VENDOR_REQUEST_JTAG_BENCHMARK:
 			return true;
 		default:
 			return false;
@@ -343,6 +345,7 @@ static bool is_jtag_programming_request(uint8_t request)
 		case VENDOR_REQUEST_JTAG_RUN_CLOCK:
 		case VENDOR_REQUEST_JTAG_GOTO_STATE:
 		case VENDOR_REQUEST_JTAG_BULK_SCAN:
+		case VENDOR_REQUEST_JTAG_BENCHMARK:
 			return true;
 		default:
 			return false;
@@ -470,6 +473,8 @@ static bool handle_vendor_request_setup(uint8_t rhport, tusb_control_request_t c
 			return handle_jtag_stop(rhport, request);
 		case VENDOR_REQUEST_JTAG_GET_STATE:
 			return handle_jtag_get_state(rhport, request);
+		case VENDOR_REQUEST_JTAG_BENCHMARK:
+			return handle_jtag_benchmark(rhport, request);
 
 		case VENDOR_REQUEST_EMERGENCY_RESET:
 			return handle_emergency_reset(rhport, request);
