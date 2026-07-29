@@ -38,6 +38,17 @@ CMD_DEVICES = 0x2C   # flash JEDEC ID + HyperRAM presence
 CMD_LED_BASE = 0x40
 CMD_LED_MASK = 0x3F
 
+# Releases the LEDs back to whatever the design drives by default.
+#
+# Without this the override is irreversible: it latches on any opcode in the
+# 0x40-0x7F range and nothing ever clears it. That range is a quarter of all
+# byte values, so a single framing error whose garbage lands in it hijacks the
+# display until the FPGA is reconfigured. Framing errors are now rejected
+# upstream, which removes the accidental path -- but an override with no
+# release is still a state the link cannot get out of, and the protocol
+# document described the command as latching without saying it was permanent.
+CMD_LED_RELEASE = 0x03
+
 # Response payload sizes, excluding the status byte and the CRC.
 PAYLOAD_SIZE = {
     CMD_PING:   2,
@@ -98,6 +109,11 @@ class UARTRx(Elaboratable):
         self.rx      = Signal(init=1)
         self.data    = Signal(8)
         self.strobe  = Signal()
+        # Frames rejected for a bad stop bit. Exposed rather than merely
+        # discarded, because a count that climbs is the difference between "the
+        # link is quiet" and "the link is receiving noise" -- and those want
+        # very different responses.
+        self.errors  = Signal(8)
 
     def elaborate(self, platform):
         m = Module()
@@ -112,8 +128,22 @@ class UARTRx(Elaboratable):
             self.data.eq(rx.data),
             # rdy is a level; strobe once per byte so downstream logic that
             # counts bytes does not see one arrival as several.
-            self.strobe.eq(rx.rdy & rx.ack),
+            #
+            # Gated on err.frame. AsyncSerialRX strobes rdy for *every*
+            # completed frame, including one whose stop bit was low, and
+            # err.frame is the only thing distinguishing a byte from noise.
+            # Without this gate a break condition -- the line held low, which
+            # is exactly what happens while Apollo re-muxes the pin or the FPGA
+            # reconfigures -- frames as several garbage bytes, each dispatched
+            # as a command and each answered with an unsolicited transmission
+            # onto a wire the master may be driving.
+            self.strobe.eq(rx.rdy & rx.ack & ~rx.err.frame),
         ]
+
+        # Saturating, so a counter pinned at 255 still reads as "bad" where a
+        # wrapped one could read as healthy.
+        with m.If(rx.rdy & rx.err.frame & (self.errors != self.errors.all())):
+            m.d.sync += self.errors.eq(self.errors + 1)
 
         return m
 
@@ -263,7 +293,7 @@ class SidebandResponder(Elaboratable):
 
         # Host-commanded LED pattern. led_override latches on the first LED
         # command so the display does not flicker back to its default state
-        # between commands.
+        # between commands, and is cleared by CMD_LED_RELEASE.
         self.led_pattern  = Signal(6)
         self.led_override = Signal()
 
@@ -419,6 +449,11 @@ class SidebandResponder(Elaboratable):
                             m.d.sync += [ok.eq(1),
                                          payload_len.eq(PAYLOAD_SIZE[CMD_POWER]),
                                          last_power.eq(1), unknown_cmd.eq(0)]
+                        with m.Case(CMD_LED_RELEASE):
+                            m.d.sync += [ok.eq(1), payload_len.eq(0),
+                                         last_power.eq(0), unknown_cmd.eq(0),
+                                         self.led_override.eq(0),
+                                         self.led_pattern.eq(0)]
                         with m.Case(CMD_DEVICES):
                             # OK reflects whether the flash ID has actually been
                             # read, so a host cannot mistake the power-on zeros

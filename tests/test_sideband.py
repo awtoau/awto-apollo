@@ -24,6 +24,7 @@ from amaranth.sim import Simulator
 
 from apollo_fpga.gateware.sideband import (
     SidebandResponder, CMD_PING, CMD_STATUS, CMD_POWER, CMD_DEVICES,
+    CMD_LED_RELEASE,
     STATUS_OK, STATUS_HEARTBEAT, STATUS_EVENTS, PROTOCOL_VERSION,
     CMD_LED_BASE,
 )
@@ -180,6 +181,50 @@ class SidebandTest(unittest.TestCase):
         status = response[0]
         self.assertFalse(status & (1 << STATUS_OK),
                          "OK must be clear while the flash ID is unread")
+
+    def test_led_override_can_be_released(self):
+        """An LED override must be reversible.
+
+        It latches on any opcode in 0x40-0x7F and nothing else clears it, so
+        without a release the responder has a state it cannot leave. That range
+        is a quarter of all byte values, which made it reachable by accident
+        before framing errors were rejected.
+        """
+        dut = SidebandResponder(clk_freq_hz=CLK_HZ, baud=BAUD)
+        m = Module()
+        m.submodules.dut = dut
+
+        sim = Simulator(m)
+        sim.add_clock(1 / CLK_HZ)
+
+        result = {}
+
+        async def bench(ctx):
+            ctx.set(dut.rx, 1)
+            for _ in range(DIVISOR * 2):
+                await ctx.tick()
+
+            # Set a pattern, then release it.
+            for command in (CMD_LED_BASE | 0b010101, CMD_LED_RELEASE):
+                for bit in ([0] + [(command >> i) & 1 for i in range(8)] + [1]):
+                    ctx.set(dut.rx, bit)
+                    for _ in range(DIVISOR):
+                        await ctx.tick()
+                # Let the response finish before sending the next command.
+                for _ in range(DIVISOR * 30):
+                    await ctx.tick()
+
+                result.setdefault("states", []).append(
+                    (ctx.get(dut.led_override), ctx.get(dut.led_pattern)))
+
+        sim.add_testbench(bench)
+        sim.run()
+
+        after_set, after_release = result["states"]
+        self.assertEqual(after_set, (1, 0b010101),
+                         "LED command should latch an override")
+        self.assertEqual(after_release, (0, 0),
+                         "CMD_LED_RELEASE should clear it")
 
     def test_unknown_command_clears_ok(self):
         """An unrecognised command must still answer, with OK clear.
