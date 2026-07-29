@@ -454,7 +454,13 @@ class ECP5CommandBasedProgrammer(ECP5Programmer):
             self._execute_command(self.Opcode.LSC_SET_WORKING_ADDRESS, b"\x01")
 
             # Shift the bitstream to the FPGA; this is essentially just executing all of the commands in the bitstream.
-            self._execute_command(self.Opcode.LSC_BITSTREAM_BURST, bitstream, check_status=False, wait_for_completion=False)
+            #
+            # The burst is write-only: the ECP5 returns nothing meaningful on TDO while the
+            # bitstream is shifted in, and configure() discards the response. Reading it back
+            # costs a GET_IN_BUFFER control transfer per chunk -- measured at ~28% of total
+            # configuration time -- so suppress it.
+            self._execute_command(self.Opcode.LSC_BITSTREAM_BURST, bitstream, check_status=False,
+                    wait_for_completion=False, ignore_response=True)
 
             # Idle for long enough to let the configuration take.
             self._allow_configuration_time()
@@ -959,7 +965,7 @@ class ECP5_JTAGProgrammer(ECP5CommandBasedProgrammer):
         self.chain.run_test(100)
 
 
-    def _execute_command(self, opcode, data_or_length=0, wait_for_completion=False, check_status=True, never_print=False, bits_per_size_unit=8, idle_afterwards=False):
+    def _execute_command(self, opcode, data_or_length=0, wait_for_completion=False, check_status=True, never_print=False, bits_per_size_unit=8, idle_afterwards=False, ignore_response=False):
         """ Issue an ECP5 configuration command.
 
         Parameters:
@@ -988,7 +994,8 @@ class ECP5_JTAGProgrammer(ECP5CommandBasedProgrammer):
 
         # Issue the command, and capture any data send in response.
         if data or length:
-            response = self.chain.shift_data(tdi=data, length=length, state_after='DRPAUSE')
+            response = self.chain.shift_data(tdi=data, length=length, state_after='DRPAUSE',
+                    ignore_response=ignore_response)
         else:
             response = b""
 

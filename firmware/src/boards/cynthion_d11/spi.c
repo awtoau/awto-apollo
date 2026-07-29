@@ -184,11 +184,41 @@ uint8_t spi_send_byte(spi_target_t port, uint8_t data)
  */
 void spi_send(spi_target_t port, void *data_to_send, void *data_received, size_t length)
 {
+	volatile sercom_t *sercom = sercom_for_target(port);
 	uint8_t *to_send  = data_to_send;
 	uint8_t *received = data_received;
 
-	// TODO: use the FIFO to bulk send data
-	for (unsigned i = 0; i < length; ++i) {
-		received[i] = spi_send_byte(port, to_send[i]);
+	if (!length) {
+		return;
 	}
+
+	// Pipelined transfer. The SERCOM has a separate TX data-register-empty (DRE)
+	// flag and receive-complete (RXC) flag, so once a byte has moved from DATA into
+	// the shift register we may queue the next one while the first is still on the
+	// wire. The naive loop (write, wait RXC, write, ...) leaves SCK idle between
+	// bytes because it will not queue byte N+1 until byte N has fully returned.
+	//
+	// Ordering is what makes this correct: we prime the first byte, then for each
+	// subsequent byte we wait for DRE and queue it BEFORE draining the previous
+	// byte's RXC. That keeps exactly one byte queued behind the one in flight, and
+	// because every queued byte is matched by exactly one blocking RXC read, no
+	// received byte is ever dropped. (An earlier version polled DRE and RXC in a
+	// single racy loop and corrupted TDO; the ECP5 then reported an all-zero
+	// status register. Hence the strict ordering here.)
+	while (sercom->SPI.INTFLAG.bit.DRE == 0);
+	sercom->SPI.DATA.reg = to_send[0];
+
+	for (size_t i = 1; i < length; ++i) {
+		// Queue the next byte as soon as the shift register has taken the last one.
+		while (sercom->SPI.INTFLAG.bit.DRE == 0);
+		sercom->SPI.DATA.reg = to_send[i];
+
+		// Now collect the byte that finished while we were queueing.
+		while (sercom->SPI.INTFLAG.bit.RXC == 0);
+		received[i - 1] = (uint8_t)sercom->SPI.DATA.reg;
+	}
+
+	// Drain the final byte, which has no successor to overlap with.
+	while (sercom->SPI.INTFLAG.bit.RXC == 0);
+	received[length - 1] = (uint8_t)sercom->SPI.DATA.reg;
 }
