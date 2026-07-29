@@ -208,6 +208,11 @@ class QuadFlashReader(Elaboratable):
         # "faster random access for code execution (XIP)", which is exactly the
         # RISC-V-executing-from-flash case rather than the bulk-transfer one.
         self.quad_io     = Signal()
+        # Start address. Previously hard-wired to zero, which meant every read
+        # hit the same page -- so a burst of reads measured the flash's
+        # sequential path repeatedly rather than its random-access one, and
+        # could not detect an address decoding fault at all.
+        self.address     = Signal(24)
         self.data_strobe = Signal()
         self.data        = Signal(8)
         self.cycles      = Signal(32)
@@ -228,8 +233,14 @@ class QuadFlashReader(Elaboratable):
         # device stays in Continuous Read Mode and expects the *next*
         # transaction to omit its opcode -- which would desynchronise every
         # following read.
-        header_1x    = Array([OPCODE_QUAD_READ, 0x00, 0x00, 0x00, 0x00])
-        header_4x    = Array([OPCODE_QUAD_IO_READ, 0x00, 0x00, 0x00,
+        # Address bytes are most-significant first, as SPI NOR expects.
+        addr_hi = self.address[16:24]
+        addr_md = self.address[8:16]
+        addr_lo = self.address[0:8]
+
+        header_1x    = Array([OPCODE_QUAD_READ, addr_hi, addr_md, addr_lo,
+                              0x00])
+        header_4x    = Array([OPCODE_QUAD_IO_READ, addr_hi, addr_md, addr_lo,
                               0x00, 0x00, 0x00])
         header_len   = Signal(range(8))
         header_index = Signal(range(8))

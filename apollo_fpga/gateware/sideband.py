@@ -6,7 +6,7 @@
 """ FPGA_ADV command responder.
 
 Half-duplex request/response over the single FPGA_ADV wire, with Apollo as the
-master. See docs/apollo_samd11_mcu/fpga-adv-command-protocol.md.
+master. See docs/apollo_samd11_mcu/fpga-adv-sideband.md.
 
     Apollo -> FPGA:  [CMD]
     FPGA  -> Apollo: [STATUS][payload ...][CRC8]

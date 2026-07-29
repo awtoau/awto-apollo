@@ -59,7 +59,7 @@ fpga_adv_mode_t fpga_adv_get_mode(void);
  *
  * Response length is a property of the command, agreed by both sides at
  * compile time, so nothing is parsed to discover it. See
- * docs/apollo_samd11_mcu/fpga-adv-command-protocol.md.
+ * docs/apollo_samd11_mcu/fpga-adv-sideband.md.
  *
  * Only valid in UART mode. Returns the number of bytes collected, or 0 on
  * timeout -- which means the FPGA is not there, not that the protocol failed.
