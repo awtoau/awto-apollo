@@ -420,6 +420,64 @@ class ApolloDebugger:
             # on its way to the bootloader either way.
             pass
 
+
+    @staticmethod
+    def exit_dfu():
+        """ Leave the Saturn-V DFU bootloader and run the application.
+
+        The inverse of `boot_to_dfu`, and until now there was none: a device in
+        the bootloader could only be recovered by physically power-cycling it.
+
+        The bootloader cannot reset itself out. It stays put whenever the reset
+        cause is the watchdog (`main.c:157`), and arming the watchdog is the
+        only reset Apollo can perform -- so any self-reset lands straight back
+        in the bootloader. `PM_RCAUSE_POR` needs power actually removed.
+
+        The way out is the one exit the bootloader already has. A zero-length
+        `DFU_DNLOAD` is the DFU specification's "download complete", and
+        `dfu.c:12` turns it into `dfuMANIFEST_SYNC` without writing any
+        firmware. That reaches `dfu_cb_manifest()`, which sets `exit_and_jump`,
+        and the main loop then calls `NVIC_SystemReset()`. That reset sets
+        `PM_RCAUSE_SYST`, which matches none of the stay-in-bootloader
+        conditions, so the next boot runs the application.
+
+        Note it is DNLOAD and not DETACH: the bootloader's DFU implementation
+        has no `DFU_DETACH` case at all, so a detach request is refused and
+        looks like a device that cannot be recovered.
+
+        Verified on hardware: boot_to_dfu, then this, returns a working
+        debugger without a replug.
+        """
+        import usb1
+
+        with usb1.USBContext() as context:
+            handle = context.openByVendorIDAndProductID(0x1d50, 0x615c)
+            if handle is None:
+                raise DebuggerNotFound("No device at 1d50:615c")
+
+            product = handle.getProduct() or ""
+            if "Bootloader" not in product:
+                raise DebuggerNotFound(
+                    f"Device is not in the bootloader (reports {product!r})")
+
+            # The interface must be claimed. A DFU control transfer is
+            # addressed to an interface, and an unclaimed one is stalled --
+            # LIBUSB_ERROR_PIPE, which reads as a refused request rather than
+            # as a missing claim.
+            handle.claimInterface(0)
+
+            # DFU_DNLOAD, zero length: download complete, nothing written.
+            handle.controlWrite(0x21, 1, 0, 0, b"", timeout=3000)
+
+            # GETSTATUS moves the state machine out of MANIFEST_SYNC. The
+            # device resets during or just after this, so an error here means
+            # it has already gone rather than that anything failed.
+            try:
+                handle.controlRead(0xa1, 3, 0, 0, 6, timeout=3000)
+            except usb1.USBError:
+                pass
+
+
     def close(self):
         """ Closes the USB device so it can be reused, possibly by another ApolloDebugger """
 

@@ -516,6 +516,8 @@ COMMANDS = [
     # Misc
     Command("leds", args=["pattern"], handler=set_led_pattern,
             help="Sets the specified pattern for the Debug LEDs."),
+    Command("exit-dfu", handler=None,
+            help="Leaves the DFU bootloader and runs the application."),
 ]
 
 
@@ -544,6 +546,17 @@ def main():
 
     # Set up python's logging to act as a simple print, for now.
     logging.basicConfig(level=logging.INFO, format="%(message)-s")
+
+    # Handled before opening a device: the bootloader is not an
+    # ApolloDebugger, so constructing one would fail before the command ran.
+    if args.command == "exit-dfu":
+        try:
+            ApolloDebugger.exit_dfu()
+            logging.info("Left the bootloader; the application is starting.")
+        except Exception as error:
+            logging.error(f"Could not leave the bootloader: {error}")
+            sys.exit(-1)
+        return
 
     if args.command == "info":
         if ApolloDebugger.print_info(force_offline=force_offline, out=logging.info):
