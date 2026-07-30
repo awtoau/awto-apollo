@@ -37,7 +37,7 @@
  * bytes of a 1024-byte reservation -- comfortable, but not with 144 bytes of slack
  * on a part that has no MPU to catch an overflow. At 512 the total is 83.98%.
  */
-#define JTAG_BUFFER_SIZE 512
+#define JTAG_BUFFER_SIZE 1024
 
 /**
  * Bytes the console RX ring needs. Declared here because it shares storage with
@@ -49,6 +49,16 @@
 // size, so use JTAG_BUFFER_SIZE for bounds -- a check against sizeof() would
 // silently become a 4-byte limit, which on a request handler is a bound that
 // passes everything real and truncates it.
+/**
+ * Limit for a scan that CAPTURES TDO, as opposed to one that discards it.
+ *
+ * The buffers overlap: transmit gets the whole region and TDO lands in its second
+ * half, so a capturing scan larger than this would overwrite data still being
+ * clocked out. jtag_scan() refuses one, and GET_INFO reports this separately so the
+ * host can discover the boundary rather than meeting it as a failed request.
+ */
+#define JTAG_READ_BUFFER_SIZE (JTAG_BUFFER_SIZE / 2u)
+
 extern uint8_t *const jtag_in_buffer;
 extern uint8_t *const jtag_out_buffer;
 extern uint8_t *const console_rx_ring;

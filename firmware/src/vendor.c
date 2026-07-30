@@ -275,17 +275,39 @@ static bool handle_get_stack_usage_request(uint8_t rhport, tusb_control_request_
  */
 static bool handle_jtag_get_info_request(uint8_t rhport, tusb_control_request_t const* request)
 {
-	static uint8_t info[8];
-	uint32_t size = JTAG_BUFFER_SIZE;
+	static uint8_t info[12];
+	uint32_t write_max = JTAG_BUFFER_SIZE;
+	uint32_t read_max  = JTAG_READ_BUFFER_SIZE;
 
-	info[0] = size & 0xff;
-	info[1] = (size >> 8) & 0xff;
-	info[2] = (size >> 16) & 0xff;
-	info[3] = (size >> 24) & 0xff;
+	// Bytes 0-3: the transmit limit, which is the whole buffer region.
+	info[0] = write_max & 0xff;
+	info[1] = (write_max >> 8) & 0xff;
+	info[2] = (write_max >> 16) & 0xff;
+	info[3] = (write_max >> 24) & 0xff;
+
+	// Bytes 4-7: platform quirks. Zero here -- QUIRK_FLIP_BITS_IN_WHOLE_BYTES and
+	// QUIRK_ALWAYS_BITBANG_JTAG describe other platforms; the d11 shifts LSB-first
+	// over SERCOM and uses the hardware SPI path for bulk scans.
 	info[4] = 0;
 	info[5] = 0;
 	info[6] = 0;
 	info[7] = 0;
+
+	// Bytes 8-11: the limit for a scan that CAPTURES TDO, which is smaller.
+	//
+	// There are two limits because the buffers overlap. Transmit gets the whole
+	// region; TDO lands in its second half, so a capturing scan larger than that
+	// would overwrite the data still being clocked out. jtag_scan() refuses such a
+	// scan, and without this field the host cannot discover the boundary -- it
+	// negotiates the transmit size and a large capturing read then simply fails.
+	//
+	// Appended rather than folded into the existing fields: bytes 4-7 are already
+	// the quirks bitmask, and a host that requests only 8 bytes gets exactly its 8,
+	// so extending the reply cannot break an older host.
+	info[8]  = read_max & 0xff;
+	info[9]  = (read_max >> 8) & 0xff;
+	info[10] = (read_max >> 16) & 0xff;
+	info[11] = (read_max >> 24) & 0xff;
 
 	return tud_control_xfer(rhport, request, info, sizeof(info));
 }

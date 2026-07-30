@@ -156,6 +156,7 @@ class JTAGChain:
         # Default to 2048 bits per scan.
         # This will be overridden in many cases by the autodetection methods below.
         self.max_bits_per_scan = 256 * 8
+        self.max_read_bits_per_scan = 256 * 8
 
         # By default, don't assume any quirks.
         self._bit_reverse_whole_bytes = False
@@ -182,14 +183,31 @@ class JTAGChain:
 
         # First, get our vitals on the JTAG connection...
         try:
-            jtag_info = self.debugger.in_request(REQUEST_JTAG_GET_INFO, length=8)
+            # 12 bytes, not 8: newer firmware appends a separate limit for scans
+            # that capture TDO. Older firmware returns 8 and the request simply
+            # yields 8, so asking for more is safe.
+            jtag_info = self.debugger.in_request(REQUEST_JTAG_GET_INFO, length=12)
 
             # .. including the maximum amount we're allowed to squish into a transaciton...
             self.max_bits_per_scan = int.from_bytes(jtag_info[0:4], byteorder='little') * 8
 
             # ... and any platform quirks present.
-            quirks = int.from_bytes(jtag_info[4:], byteorder='little')
+            quirks = int.from_bytes(jtag_info[4:8], byteorder='little')
             self._bit_reverse_whole_bytes = bool(quirks & QUIRK_FLIP_BITS_IN_WHOLE_BYTES)
+
+            # A scan that captures TDO may be limited more tightly than one that
+            # discards it, because the firmware's transmit and receive buffers can
+            # overlap: TDO lands in the second half of the region the payload
+            # occupies. Without this the host negotiates the transmit size and a
+            # large capturing read fails outright rather than being split.
+            #
+            # Absent on firmware that returns only 8 bytes, in which case the two
+            # limits are the same.
+            if len(jtag_info) >= 12:
+                self.max_read_bits_per_scan = \
+                    int.from_bytes(jtag_info[8:12], byteorder='little') * 8
+            else:
+                self.max_read_bits_per_scan = self.max_bits_per_scan
 
         except IOError:
             pass
@@ -254,7 +272,10 @@ class JTAGChain:
 
         bits_left_to_scan = bits_to_scan
         while bits_left_to_scan > 0:
-            bits_in_chunk = min(bits_left_to_scan, self.max_bits_per_scan)
+            # _receive_data always captures TDO, so it takes the read limit --
+            # which may be smaller than the transmit limit when the firmware's
+            # buffers overlap.
+            bits_in_chunk = min(bits_left_to_scan, self.max_read_bits_per_scan)
             bits_left_to_scan -= bits_in_chunk
             chunk = self._receive_data_chunk(bits_in_chunk)
 
@@ -303,7 +324,14 @@ class JTAGChain:
 
         #self._realign_data_if_necessary(bits_to_scan, transmit)
 
-        bytes_per_chunk = self.max_bits_per_scan // 8
+        # A scan that captures TDO may be bounded more tightly than one that
+        # discards it, because the firmware's transmit and receive buffers can
+        # overlap -- TDO lands in the second half of the region the payload
+        # occupies. Using the transmit limit for a capturing scan makes the
+        # firmware refuse the request outright rather than the host splitting it.
+        limit = (self.max_bits_per_scan if ignore_response
+                 else self.max_read_bits_per_scan)
+        bytes_per_chunk = limit // 8
         bits_per_chunk  = bytes_per_chunk * 8
 
         while bits_to_scan:
