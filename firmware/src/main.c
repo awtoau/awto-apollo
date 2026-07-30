@@ -92,6 +92,20 @@ int main(void)
 
 	while (1) {
 		tud_task(); // tinyusb device task
+		// Clock out any scan the host has queued.
+		//
+		// Placed immediately after tud_task() and before everything else so the
+		// SERCOM starts as soon as possible after the SCAN request that queued it.
+		// The clocking is what overlaps with the next chunk's USB transfer, so every
+		// microsecond between the request arriving and the clocking starting is a
+		// microsecond of overlap lost.
+		//
+		// It runs to completion rather than in slices: spi_send() is a blocking spin
+		// on the SERCOM flags, and the USB peripheral fills the other buffer by DMA
+		// with no CPU involvement, so nothing needs the CPU meanwhile. A 1024-byte
+		// scan holds it for about 700 us at 12 MHz SCK, which is well inside the
+		// host's control-transfer timeout for the request that follows.
+		jtag_scan_task();
 		console_task();
 		led_task();
 		button_task();

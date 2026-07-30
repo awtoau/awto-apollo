@@ -158,6 +158,15 @@ class JTAGChain:
         self.max_bits_per_scan = 256 * 8
         self.max_read_bits_per_scan = 256 * 8
 
+        # The firmware's second transmit buffer, in bytes, or 0 if it has only one.
+        #
+        # When it has two, a discarding SCAN returns as soon as the scan is queued
+        # rather than after it has been clocked, so the host may stage the next chunk
+        # while the previous one is still on the wire. The chunks must then alternate
+        # in size to match the firmware's buffers, which differ -- see
+        # _alternating_chunk_sizes().
+        self.alt_buffer_bytes = 0
+
         # By default, don't assume any quirks.
         self._bit_reverse_whole_bytes = False
         self._force_jtag_bitbang      = False
@@ -183,10 +192,11 @@ class JTAGChain:
 
         # First, get our vitals on the JTAG connection...
         try:
-            # 12 bytes, not 8: newer firmware appends a separate limit for scans
-            # that capture TDO. Older firmware returns 8 and the request simply
-            # yields 8, so asking for more is safe.
-            jtag_info = self.debugger.in_request(REQUEST_JTAG_GET_INFO, length=12)
+            # 16 bytes, not 8: newer firmware appends a separate limit for scans
+            # that capture TDO, and then the size of its second transmit buffer.
+            # Older firmware returns fewer bytes and the request simply yields what
+            # it has, so asking for more is safe.
+            jtag_info = self.debugger.in_request(REQUEST_JTAG_GET_INFO, length=16)
 
             # .. including the maximum amount we're allowed to squish into a transaciton...
             self.max_bits_per_scan = int.from_bytes(jtag_info[0:4], byteorder='little') * 8
@@ -208,6 +218,15 @@ class JTAGChain:
                     int.from_bytes(jtag_info[8:12], byteorder='little') * 8
             else:
                 self.max_read_bits_per_scan = self.max_bits_per_scan
+
+            # The size of the firmware's second transmit buffer, if it has one.
+            # Non-zero means a discarding SCAN returns once queued rather than once
+            # clocked, so staging the next chunk overlaps with clocking this one.
+            if len(jtag_info) >= 16:
+                self.alt_buffer_bytes = \
+                    int.from_bytes(jtag_info[12:16], byteorder='little')
+            else:
+                self.alt_buffer_bytes = 0
 
         except IOError:
             pass
@@ -332,16 +351,36 @@ class JTAGChain:
         limit = (self.max_bits_per_scan if ignore_response
                  else self.max_read_bits_per_scan)
         bytes_per_chunk = limit // 8
-        bits_per_chunk  = bytes_per_chunk * 8
+
+        # Chunk sizes for the pipelined path.
+        #
+        # With two firmware buffers the chunks land alternately in one and then the
+        # other, and the two are different sizes, so a single fixed chunk size cannot
+        # be right for both: sized for the larger it overruns the smaller, sized for
+        # the smaller it wastes half of the larger. This yields the size for each
+        # chunk in turn.
+        #
+        # Only on the discarding path. A capturing scan is not deferred by the
+        # firmware (the host reads TDO back immediately afterwards, so there is
+        # nothing to overlap with), and it is bounded by the read limit anyway.
+        if ignore_response and self.alt_buffer_bytes:
+            sizes = [bytes_per_chunk, min(self.alt_buffer_bytes,
+                                          bytes_per_chunk)]
+        else:
+            sizes = [bytes_per_chunk]
+        size_index = 0
 
         while bits_to_scan:
-            bits_in_chunk = min(bits_to_scan, bits_per_chunk)
+            this_chunk_bytes = sizes[size_index % len(sizes)]
+            size_index += 1
+
+            bits_in_chunk = min(bits_to_scan, this_chunk_bytes * 8)
             bits_to_scan -= bits_in_chunk
             advance_state = not bool(bits_to_scan)
 
             if byte_data:
-                chunk = transmit[0:bytes_per_chunk]
-                del transmit[0:bytes_per_chunk]
+                chunk = transmit[0:this_chunk_bytes]
+                del transmit[0:this_chunk_bytes]
             else:
                 chunk = None
 

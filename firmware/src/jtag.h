@@ -18,8 +18,8 @@
  * Size of each JTAG scan buffer, in bytes.
  *
  * Declared here rather than in jtag.c because the buffers are used outside it:
- * fpga.c stages ISC_ENABLE / ISC_DISABLE into jtag_out_buffer directly. It had
- * its own `extern uint8_t jtag_out_buffer[256];` with the 256 written out a
+ * fpga.c stages ISC_ENABLE / ISC_DISABLE through jtag_fill_buffer() directly. It
+ * had its own `extern uint8_t jtag_out_buffer[256];` with the 256 written out a
  * second time, so changing the size in one place left the other silently
  * disagreeing -- and an array bound that disagrees with its definition is the
  * kind of mismatch a compiler is under no obligation to mention.
@@ -38,6 +38,28 @@
  * on a part that has no MPU to catch an overflow. At 512 the total is 83.98%.
  */
 #define JTAG_BUFFER_SIZE 1024
+
+/**
+ * Size of the SECOND transmit buffer, which exists so that a USB transfer filling
+ * one buffer can overlap with the SERCOM clocking the other.
+ *
+ * 512 rather than 1024, and the asymmetry is forced by RAM rather than chosen. A
+ * second full-size buffer costs +1024 bytes; the part has 1216 unallocated, so it
+ * physically fits -- but it puts static RAM at 95.3% and
+ * scripts/apollo_budget_check.py fails anything above 85%. Under that ceiling
+ * there are 601 bytes to spend, so 512 is the largest power of two available.
+ *
+ * Losing nothing by it is not an assumption: scripts/jtag_cost_split.py measures
+ * the two halves separately at 1024 B/chunk and finds staging 339.7 ms against
+ * clocking 107.4 ms. The second buffer only ever has to hide CLOCKING behind
+ * staging, and 512 bytes of clocking (~42 ms) is far less than 1024 bytes of
+ * staging (~340 ms), so the smaller buffer still covers the whole overlap. Making
+ * it 1024 would buy no additional overlap and cost 512 bytes of RAM.
+ *
+ * The primary buffer stays 1024 so the negotiated chunk size, and therefore the
+ * chunk count in a configure, is unchanged.
+ */
+#define JTAG_ALT_BUFFER_SIZE 512
 
 /**
  * Bytes the console RX ring needs. Declared here because it shares storage with
@@ -60,8 +82,43 @@
 #define JTAG_READ_BUFFER_SIZE (JTAG_BUFFER_SIZE / 2u)
 
 extern uint8_t *const jtag_in_buffer;
-extern uint8_t *const jtag_out_buffer;
 extern uint8_t *const console_rx_ring;
+
+/**
+ * The transmit buffer currently being FILLED, which is what a caller staging data
+ * wants. No longer a fixed pointer: with two buffers alternating, the one being
+ * filled changes every chunk, so a `uint8_t *const` cannot name it.
+ *
+ * fpga.c stages single opcode bytes through this, and does so between scans rather
+ * than during one, so it always sees an idle buffer.
+ */
+uint8_t *jtag_fill_buffer(void);
+
+/**
+ * True if a scan is queued or in progress, so the buffer being filled is not the
+ * one being clocked.
+ */
+bool jtag_scan_pending(void);
+
+/**
+ * Clocks out a scan queued by handle_jtag_request_scan(), if there is one.
+ *
+ * Called from the main loop rather than from the request handler: the handler
+ * returns as soon as the scan is queued, which frees the host to stage the next
+ * chunk over USB while this clocks the previous one. That overlap is the entire
+ * point -- see the comment on jtag_queue_scan() in jtag.c.
+ */
+void jtag_scan_task(void);
+
+/**
+ * Blocks until any queued scan has finished clocking.
+ *
+ * Bounded by the work already queued -- at most JTAG_BUFFER_SIZE bytes at 12 MHz
+ * SCK, about 700 us -- and not by a timeout, because the SERCOM loop it waits on
+ * is itself bounded and cannot fail to terminate. On return the previously
+ * queued scan is complete and both buffers are idle.
+ */
+void jtag_scan_drain(void);
 
 typedef enum e_TAPState
 {
@@ -104,6 +161,17 @@ bool jtag_scan(uint32_t num_bits, bool advance_state, bool bitbang,
 
 
 /**
+ * Performs a JTAG scan out of an explicitly named buffer.
+ *
+ * The source is no longer implied now that two transmit buffers alternate: the
+ * overlapped path clocks the buffer filled one chunk ago, not the one being filled
+ * now.
+ */
+bool jtag_scan_from(uint8_t *out_buffer, uint32_t num_bits, bool advance_state,
+                    bool bitbang, bool discard_tdo);
+
+
+/**
  * Moves to a given JTAG state.
  */
 void jtag_goto_state(int state);
@@ -136,6 +204,16 @@ bool handle_jtag_request_clear_out_buffer(uint8_t rhport, tusb_control_request_t
  * This is used to set the data to be transmitted during the next scan.
  */
 bool handle_jtag_request_set_out_buffer(uint8_t rhport, tusb_control_request_t const* request);
+
+
+/**
+ * Called once a SET_OUT_BUFFER's data has actually landed in the buffer.
+ *
+ * Returning from the setup handler does not mean the bytes arrived -- the USB DMA
+ * engine was only handed the address. Dispatched from CONTROL_STAGE_DATA, the first
+ * point at which the buffer contents are known good.
+ */
+bool handle_jtag_request_set_out_buffer_complete(uint8_t rhport, tusb_control_request_t const* request);
 
 
 /**

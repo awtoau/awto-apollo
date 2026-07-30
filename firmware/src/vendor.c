@@ -275,9 +275,10 @@ static bool handle_get_stack_usage_request(uint8_t rhport, tusb_control_request_
  */
 static bool handle_jtag_get_info_request(uint8_t rhport, tusb_control_request_t const* request)
 {
-	static uint8_t info[12];
+	static uint8_t info[16];
 	uint32_t write_max = JTAG_BUFFER_SIZE;
 	uint32_t read_max  = JTAG_READ_BUFFER_SIZE;
+	uint32_t alt_max   = JTAG_ALT_BUFFER_SIZE;
 
 	// Bytes 0-3: the transmit limit, which is the whole buffer region.
 	info[0] = write_max & 0xff;
@@ -308,6 +309,20 @@ static bool handle_jtag_get_info_request(uint8_t rhport, tusb_control_request_t 
 	info[9]  = (read_max >> 8) & 0xff;
 	info[10] = (read_max >> 16) & 0xff;
 	info[11] = (read_max >> 24) & 0xff;
+
+	// Bytes 12-15: the size of the SECOND transmit buffer, or zero on firmware with
+	// only one.
+	//
+	// Non-zero tells the host that a discarding SCAN completes as soon as the scan is
+	// QUEUED, so it may stage the next chunk while this one is still clocking. The
+	// host must then alternate its chunk sizes to match the two buffers, which differ
+	// -- so it needs the size, not merely a flag. A host that asks for 12 bytes gets
+	// 12 and simply does not pipeline, which is the correct behaviour for one that
+	// predates this.
+	info[12] = alt_max & 0xff;
+	info[13] = (alt_max >> 8) & 0xff;
+	info[14] = (alt_max >> 16) & 0xff;
+	info[15] = (alt_max >> 24) & 0xff;
 
 	return tud_control_xfer(rhport, request, info, sizeof(info));
 }
@@ -668,6 +683,11 @@ static bool handle_vendor_request_complete(uint8_t rhport, tusb_control_request_
 			return handle_debug_spi_send_complete(rhport, request);
 		case VENDOR_REQUEST_FLASH_SPI_SEND:
 			return handle_flash_spi_send_complete(rhport, request);
+		// The staged chunk has now actually landed in the buffer. The setup handler
+		// only handed the address to the DMA engine, so this is the first point at
+		// which the data is known to be there.
+		case VENDOR_REQUEST_JTAG_SET_OUT_BUFFER:
+			return handle_jtag_request_set_out_buffer_complete(rhport, request);
 		default:
 			return true;
 	}
