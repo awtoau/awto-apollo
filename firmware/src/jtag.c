@@ -65,15 +65,25 @@ uint8_t *const console_rx_ring = comms.console_ring;
  * Flags for our JTAG commands.
  */
 enum {
-        FLAG_ADVANCE_STATE = 0b01,
-        FLAG_FORCE_BITBANG = 0b10
+        FLAG_ADVANCE_STATE = 0b001,
+        FLAG_FORCE_BITBANG = 0b010,
+
+        // The host does not want TDO back, so it need not be stored.
+        //
+        // The host already had an `ignore_response` notion, but it only suppressed
+        // the host's own GET_IN_BUFFER call -- the firmware still captured every
+        // byte into jtag_in_buffer. Telling the firmware means the receive buffer
+        // does not have to exist for the write path, which is what makes a larger
+        // transmit buffer affordable.
+        FLAG_DISCARD_TDO   = 0b100
 };
 
 
 /**
  * Performs JTAG scan.
  */
-bool jtag_scan(uint32_t num_bits, bool advance_state, bool bitbang)
+bool jtag_scan(uint32_t num_bits, bool advance_state, bool bitbang,
+               bool discard_tdo)
 {
 	// Our bulk method can only send whole bytes; so send as many bytes as we can
 	// using the fast method; and then send the remainder using our slow method.
@@ -108,7 +118,10 @@ bool jtag_scan(uint32_t num_bits, bool advance_state, bool bitbang)
 	// Switch to SPI mode, and send the bulk of the transfer using it.
 	if (bytes_to_send_bulk) {
 		spi_configure_pinmux(SPI_FPGA_JTAG);
-		spi_send(SPI_FPGA_JTAG, jtag_out_buffer, jtag_in_buffer, bytes_to_send_bulk);
+		// NULL receive means "clock these out and drop what comes back", so the
+		// receive buffer is untouched on the write path.
+		spi_send(SPI_FPGA_JTAG, jtag_out_buffer,
+		         discard_tdo ? NULL : jtag_in_buffer, bytes_to_send_bulk);
 	}
 
 	// Switch back to GPIO mode, and send the remainder using the slow method.
@@ -186,7 +199,9 @@ bool handle_jtag_request_get_in_buffer(uint8_t rhport, tusb_control_request_t co
  */
 bool handle_jtag_request_scan(uint8_t rhport, tusb_control_request_t const* request)
 {
-	if (jtag_scan(request->wValue, request->wIndex & FLAG_ADVANCE_STATE, request->wIndex & FLAG_FORCE_BITBANG)) {
+	if (jtag_scan(request->wValue, request->wIndex & FLAG_ADVANCE_STATE,
+	              request->wIndex & FLAG_FORCE_BITBANG,
+	              request->wIndex & FLAG_DISCARD_TDO)) {
 		return tud_control_xfer(rhport, request, NULL, 0);
 	} else {
 		return false;

@@ -89,7 +89,8 @@ void jtag_deinit(void);
 /**
  * Performs JTAG scan.
  */
-bool jtag_scan(uint32_t num_bits, bool advance_state, bool bitbang);
+bool jtag_scan(uint32_t num_bits, bool advance_state, bool bitbang,
+               bool discard_tdo);
 
 
 /**

@@ -59,11 +59,11 @@ __attribute__((weak)) void force_fpga_offline(void)
 	jtag_go_to_state(STATE_TEST_LOGIC_RESET);
 	jtag_go_to_state(STATE_SHIFT_IR);
 	jtag_out_buffer[0] = ISC_ENABLE;
-	jtag_scan(8, true, false);
+	jtag_scan(8, true, false, false);
 	jtag_go_to_state(STATE_PAUSE_IR);
 	jtag_go_to_state(STATE_SHIFT_DR);
 	jtag_out_buffer[0] = 0;
-	jtag_scan(8, true, false);
+	jtag_scan(8, true, false, false);
 	jtag_go_to_state(STATE_PAUSE_DR);
 	jtag_go_to_state(STATE_RUN_TEST_IDLE);
 	jtag_wait_time(2);

@@ -361,8 +361,18 @@ class JTAGChain:
             self.debugger.out_request(REQUEST_JTAG_SET_OUT_BUFFER, data=bytes_to_send)
 
         # Figure out the flags we're going to use for our transaction.
-        flags  = 0b01 if advance_state            else 0
-        flags |= 0b10 if self._force_jtag_bitbang else 0
+        flags  = 0b001 if advance_state            else 0
+        flags |= 0b010 if self._force_jtag_bitbang else 0
+        # Tell the firmware it need not capture TDO.
+        #
+        # ignore_response previously only suppressed the GET_IN_BUFFER call on this
+        # side; the firmware still stored every byte. Passing it through means the
+        # receive buffer is not written at all on the write path, which is what
+        # allows a larger transmit buffer to be afforded.
+        #
+        # Older firmware ignores the bit -- it masks only the two flags it knows --
+        # so this is safe against a device that predates it.
+        flags |= 0b100 if ignore_response          else 0
 
         self.debugger.out_request(REQUEST_JTAG_SCAN, value=bits_to_scan, index=flags)
 
