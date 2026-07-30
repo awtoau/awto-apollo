@@ -55,6 +55,15 @@ enum {
 	VENDOR_REQUEST_JTAG_RUN_CLOCK          = 0xb4,
 	VENDOR_REQUEST_JTAG_GOTO_STATE         = 0xb5,
 	VENDOR_REQUEST_JTAG_GET_STATE          = 0xb6,
+	// Reserved upstream for a bulk JTAG scan that was never implemented: there is
+	// no handler and no case in the dispatch switch, here or in stock v1.1.1.
+	//
+	// Do NOT add it to is_jtag_request() or is_jtag_programming_request(). It was
+	// in both until this comment replaced them, which armed an upstream
+	// placeholder: 0xb7 escalated the session to "programming in flight" and then
+	// fell through to `return false`, leaving the JTAG lock held by a request
+	// that cannot complete. Gating a request that cannot be dispatched has no
+	// meaning. Kept as a constant so the ID is not silently reused.
 	VENDOR_REQUEST_JTAG_BULK_SCAN          = 0xb7,
 	VENDOR_REQUEST_JTAG_GET_INFO           = 0xb8,
 	VENDOR_REQUEST_JTAG_BENCHMARK          = 0xb9,
@@ -466,7 +475,6 @@ static bool is_jtag_request(uint8_t request)
 		case VENDOR_REQUEST_JTAG_RUN_CLOCK:
 		case VENDOR_REQUEST_JTAG_GOTO_STATE:
 		case VENDOR_REQUEST_JTAG_GET_STATE:
-		case VENDOR_REQUEST_JTAG_BULK_SCAN:
 		case VENDOR_REQUEST_JTAG_BENCHMARK:
 			return true;
 		default:
@@ -487,7 +495,6 @@ static bool is_jtag_programming_request(uint8_t request)
 		case VENDOR_REQUEST_JTAG_SCAN:
 		case VENDOR_REQUEST_JTAG_RUN_CLOCK:
 		case VENDOR_REQUEST_JTAG_GOTO_STATE:
-		case VENDOR_REQUEST_JTAG_BULK_SCAN:
 		case VENDOR_REQUEST_JTAG_BENCHMARK:
 			return true;
 		default:
