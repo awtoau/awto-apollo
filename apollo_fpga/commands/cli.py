@@ -338,6 +338,21 @@ def program_flash_fast_deprecated(device, args):
     return program_flash_fast(device, args)
 
 
+def enter_dfu(device, args):
+    """Reboot into the DFU bootloader.
+
+    The counterpart to exit-dfu, which existed without it: 0xed and
+    boot_to_dfu() have been available since df4a93b, but only from Python, so
+    reflashing from a shell meant writing a script to call one method.
+
+    The device drops off the bus as it resets, so there is nothing to report
+    afterwards beyond the fact that the request was accepted.
+    """
+    device.boot_to_dfu()
+    logging.info("Rebooting into the bootloader; the device will re-enumerate "
+                 "as \"Cynthion Bootloader\".")
+
+
 def read_back_flash(device, args):
     ensure_unconfigured(device)
 
@@ -511,6 +526,8 @@ COMMANDS = [
             help="Reads or writes to a provided register of JTAG-tunneled debug SPI."),
 
     # Misc
+    Command("enter-dfu", handler=enter_dfu,
+            help="Reboots Apollo into the DFU bootloader, for reflashing."),
     Command("exit-dfu", handler=None,
             help="Leaves the DFU bootloader and runs the application."),
 ]
