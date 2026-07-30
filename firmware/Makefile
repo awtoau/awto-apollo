@@ -83,6 +83,27 @@ CFLAGS += \
 # default balanced partitioning GCC cannot inline across partition boundaries,
 # which on a program this small costs most of the benefit.
 CFLAGS  += -flto=auto -flto-partition=one
+# Stack reservation, from measurement rather than convention.
+#
+# The default is 0x400 (1024 bytes) and was never measured. stack_probe.c paints
+# the region and reports the high-water mark over vendor request 0xa5: 344 bytes
+# at the deepest path exercised -- idle, a control-transfer burst, 50 sideband
+# commands, and a full JTAG configure.
+#
+# 0x2C0 is 704 bytes, slightly over 2x the measurement. The margin is deliberate
+# and generous because the figure is a LOWER bound twice over: depth already in
+# use when painting ran is invisible, and one run does not prove a worst case --
+# an interrupt arriving at the deepest point of the deepest call path may simply
+# not have occurred. This part has no MPU, so an overflow corrupts .bss silently
+# rather than faulting.
+#
+# The linker script already honours an override:
+#   STACK_SIZE = DEFINED (STACK_SIZE) ? STACK_SIZE : ... : 0x400
+# so no linker-script edit is needed.
+#
+# 320 bytes reclaimed, which is what makes 1024-byte JTAG chunks reachable.
+LDFLAGS += -Wl,--defsym=STACK_SIZE=0x2C0
+
 LDFLAGS += -flto=auto -flto-partition=one -Wl,--entry=Reset_Handler -Wl,-u,exception_table
 
 INC += \
