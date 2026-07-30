@@ -12,6 +12,28 @@
 #ifndef __JTAG_H__
 #define __JTAG_H__
 
+#include <stdint.h>
+
+/**
+ * Size of each JTAG scan buffer, in bytes.
+ *
+ * Declared here rather than in jtag.c because the buffers are used outside it:
+ * fpga.c stages ISC_ENABLE / ISC_DISABLE into jtag_out_buffer directly. It had
+ * its own `extern uint8_t jtag_out_buffer[256];` with the 256 written out a
+ * second time, so changing the size in one place left the other silently
+ * disagreeing -- and an array bound that disagrees with its definition is the
+ * kind of mismatch a compiler is under no obligation to mention.
+ *
+ * The value is also a protocol constant, not a free choice: the host stages one
+ * chunk per SET_OUT_BUFFER request, and jtag.h's own vendor-request
+ * documentation encodes "0 means 256" in a single wIndex byte. Raising it means
+ * changing that encoding too.
+ */
+#define JTAG_BUFFER_SIZE 256
+
+extern uint8_t jtag_in_buffer[JTAG_BUFFER_SIZE];
+extern uint8_t jtag_out_buffer[JTAG_BUFFER_SIZE];
+
 typedef enum e_TAPState
 {
 	STATE_TEST_LOGIC_RESET =  0,

@@ -12,7 +12,6 @@
 #include "fpga_adv.h"
 
 
-extern uint8_t jtag_out_buffer[256];
 
 /*
  * Written from USB interrupt context (the vendor request handlers, e.g. the

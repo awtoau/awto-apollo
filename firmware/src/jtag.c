@@ -28,8 +28,8 @@
 
 
 // JTAG comms buffers.
-uint8_t jtag_in_buffer[256] __attribute__((aligned(4)));
-uint8_t jtag_out_buffer[256] __attribute__((aligned(4)));
+uint8_t jtag_in_buffer[JTAG_BUFFER_SIZE] __attribute__((aligned(4)));
+uint8_t jtag_out_buffer[JTAG_BUFFER_SIZE] __attribute__((aligned(4)));
 
 
 /**

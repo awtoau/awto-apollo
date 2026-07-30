@@ -11,8 +11,6 @@
 
 #include <jtag.h>
 
-extern uint8_t jtag_in_buffer[256];
-extern uint8_t jtag_out_buffer[256];
 
 
 /**
