@@ -63,8 +63,6 @@
 // captured TDO, the capture would overwrite the second half of the data still being
 // clocked out. FLAG_DISCARD_TDO is what prevents that, and the assertion below is
 // what stops the two definitions drifting apart.
-#define JTAG_READ_BUFFER_SIZE (JTAG_BUFFER_SIZE / 2u)
-
 union comms_buffers {
 	uint8_t jtag_tx[JTAG_BUFFER_SIZE];
 	uint8_t console_ring[CONSOLE_RING_SIZE];
@@ -336,12 +334,32 @@ bool handle_jtag_benchmark(uint8_t rhport, tusb_control_request_t const* request
 	static uint8_t result[12];
 
 	uint16_t repeats = request->wValue;
-	uint16_t chunk   = request->wIndex & 0xFF;
+
+	// Chunk size in 64-byte units, and the SERCOM divider, packed into wIndex.
+	//
+	// It was previously a raw byte count in the low byte with "0 means full
+	// buffer". That silently broke once the buffer exceeded 256: asking for 512
+	// truncated to 0, which the firmware read as "use the whole buffer" -- so a
+	// request for 512 x 240 clocked 1024 x 240 = 245760 bytes in one
+	// uninterruptible loop, overran the host's control-transfer timeout, and took
+	// the device off the bus entirely. A physical replug was needed.
+	//
+	// 64-byte units reach 16320 bytes in a byte, which is far beyond any buffer
+	// this part will hold, and there is no magic zero to misread. 0 is simply
+	// invalid.
+	uint16_t chunk   = (uint16_t)(request->wIndex & 0xFF) * 64u;
 	uint8_t  divider = (request->wIndex >> 8) & 0xFF;
 
-	// A chunk of 0 means a full buffer; 256 does not fit in the low byte.
-	if (chunk == 0) {
-		chunk = JTAG_BUFFER_SIZE;
+	if (chunk == 0 || chunk > JTAG_BUFFER_SIZE) {
+		return false;
+	}
+
+	// Bound the total work, so a large repeats cannot exceed the host's
+	// control-transfer timeout the way the truncation bug did. At 12 MHz SCK,
+	// 65536 bytes is about 44 ms of clocking -- comfortably inside a 500 ms
+	// timeout, and far more than any single measurement needs.
+	if ((uint32_t)chunk * repeats > 65536u) {
+		return false;
 	}
 	if (repeats == 0) {
 		return false;

@@ -194,8 +194,16 @@ bool handle_jtag_get_state(uint8_t rhport, tusb_control_request_t const* request
  *
  * Arguments:
  *     wValue: number of repeats
- *     wIndex: low byte -- chunk size (0 means 256); high byte -- SERCOM baud
- *             divider, or 0xFF to keep the JTAG default.
+ *     wIndex: low byte -- chunk size in 64-BYTE UNITS (so 8 means 512 bytes);
+ *             high byte -- SERCOM baud divider, or 0xFF to keep the JTAG default.
+ *
+ * Chunk was previously a raw byte count with "0 means full buffer", which broke
+ * silently once the buffer exceeded 256 bytes: 512 truncated to 0, read as "full
+ * buffer", and a 512 x 240 request clocked 245760 bytes in one uninterruptible
+ * loop -- overrunning the host timeout and dropping the device off the bus.
+ *
+ * Total work is now bounded at 65536 bytes (about 44 ms of clocking at 12 MHz), so
+ * a mis-sized request is refused rather than wedging the board.
  */
 bool handle_jtag_benchmark(uint8_t rhport, tusb_control_request_t const* request);
 
