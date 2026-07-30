@@ -423,7 +423,8 @@ uint8_t fpga_adv_command(uint8_t command, uint8_t *buffer, uint8_t length)
 	// Until DONE goes high the FPGA's I/O are tri-stated, so FPGA_ADV floats,
 	// held only by our pull-up. There is no responder to answer, and a
 	// floating CMOS input can pick up noise the receiver frames as spurious
-	// start bits. Returning 0 is honest -- the link does not exist yet -- and
+	// start bits. Returning 0 states the actual situation -- the link does not
+	// exist yet -- and
 	// distinguishes "FPGA not ready" from "FPGA did not reply", which a
 	// timeout alone cannot.
 	//
