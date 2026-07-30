@@ -45,12 +45,18 @@
 
 
 
-// Housekeeping tick. 5 ms is chosen against human timescales, not USB ones: the
-// shortest thing serviced on it is LED perception at ~16 ms, so 5 ms is 3x
-// faster than anything that could look laggy. On expiry led_task() and
-// button_task() run once; nothing is lost by a missed tick, since both read
-// current state rather than accumulate.
-#define HOUSEKEEPING_PERIOD_MS 5u
+// Housekeeping tick, chosen against human timescales rather than USB ones.
+//
+// 20 ms: a button press lasts 50-200 ms, so this samples the shortest credible
+// press at least twice, and it sits at the ~16 ms LED perception threshold so a
+// state change still reads as immediate. On expiry led_task() and button_task()
+// run once; nothing is lost by a missed tick, since both read current state
+// rather than accumulate.
+//
+// 5 ms was measured first; 20 ms is not distinguishable from it (322.2 vs 318.1
+// ms at 1024 B, with 7.0 and 5.3 ms spreads). The slower rate is kept because it
+// is the correct rate for a human-scale input, not because it is faster.
+#define HOUSEKEEPING_PERIOD_MS 20u
 
 static uint32_t next_housekeeping_ms = 0;
 
@@ -134,9 +140,9 @@ int main(void)
 		// since PA16 is shared with LED_A and each poll re-muxes the pin and waits
 		// 50 cycles for the pull-up to settle.
 		//
-		// HOUSEKEEPING_PERIOD_MS is 5: still 3x faster than the shortest human
-		// timescale here and 10x under the perception threshold, so nothing looks
-		// laggy, while cutting both from ~200 kHz to 200 Hz.
+		// HOUSEKEEPING_PERIOD_MS is 20, which still samples the shortest credible
+		// button press twice over and sits at the LED perception threshold, while
+		// cutting both from ~200 kHz to 50 Hz.
 		//
 		// Stated plainly: this is NOT a throughput win. Removing the button poll
 		// entirely measured 326.4 against 327.9 ms, inside the run spread,
