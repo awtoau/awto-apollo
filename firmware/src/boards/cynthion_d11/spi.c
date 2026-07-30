@@ -182,6 +182,16 @@ uint8_t spi_send_byte(spi_target_t port, uint8_t data)
  * @param data_received Any data received during the SPI transaction.
  * @param length The total length of the data to be exchanged, in bytes.
  */
+// data_received may be NULL, meaning "clock these bytes out and discard what comes
+// back". SPI is inherently bidirectional -- every byte sent clocks one in -- so the
+// hardware hands over a byte whether the caller wants it or not, and previously that
+// byte was written to the caller's pointer unconditionally. Passing NULL wrote to
+// address 0.
+//
+// This matters for FPGA configuration, which never reads TDO: the ECP5 self-validates
+// by CRC, so ecp5.py passes ignore_response=True and the host never fetches the
+// receive buffer. Discarding rather than storing means a 512-byte receive buffer does
+// not have to exist for the write path.
 void spi_send(spi_target_t port, void *data_to_send, void *data_received, size_t length)
 {
 	volatile sercom_t *sercom = sercom_for_target(port);
@@ -214,11 +224,21 @@ void spi_send(spi_target_t port, void *data_to_send, void *data_received, size_t
 		sercom->SPI.DATA.reg = to_send[i];
 
 		// Now collect the byte that finished while we were queueing.
+		//
+		// DATA must be read even when the caller does not want it: RXC stays set
+		// until DATA is read, and the loop above waits on RXC, so skipping the
+		// read hangs on the next iteration rather than merely discarding a byte.
 		while (sercom->SPI.INTFLAG.bit.RXC == 0);
-		received[i - 1] = (uint8_t)sercom->SPI.DATA.reg;
+		uint8_t got = (uint8_t)sercom->SPI.DATA.reg;
+		if (received) {
+			received[i - 1] = got;
+		}
 	}
 
 	// Drain the final byte, which has no successor to overlap with.
 	while (sercom->SPI.INTFLAG.bit.RXC == 0);
-	received[length - 1] = (uint8_t)sercom->SPI.DATA.reg;
+	uint8_t last = (uint8_t)sercom->SPI.DATA.reg;
+	if (received) {
+		received[length - 1] = last;
+	}
 }
