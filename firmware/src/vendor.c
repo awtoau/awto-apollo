@@ -13,6 +13,9 @@
 
 #include <apollo_board.h>
 #include <tusb.h>
+// For usbd_handle_setup() and usbd_event_queue_empty(), used by
+// dcd_setup_fast_path() at the bottom of this file.
+#include <device/usbd_pvt.h>
 
 #include "led.h"
 #include "jtag.h"
@@ -716,4 +719,93 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
 
 	}
 
+}
+
+
+/**
+ * Services the two per-chunk JTAG requests from the USB interrupt, skipping the
+ * event queue.
+ *
+ * Overrides the weak default in dcd_samd.c, which is called from dcd_int_handler()
+ * the moment a SETUP arrives. Everything not claimed here is queued exactly as
+ * before, so this is a fast path over the normal one rather than a replacement for
+ * it.
+ *
+ * ## Why
+ *
+ * dcd_event_setup_received() only ever writes to the event queue; tud_task()
+ * dequeues from the main loop. A SETUP that lands just after tud_task() returned
+ * therefore waits a full loop pass before the device says anything, and the host
+ * sees NAKs until it does -- measured at ~98 us per transaction against 47 us of
+ * wire time for a 64-byte packet. A bitstream download issues two of these requests
+ * per chunk and nothing else, so that latency is most of what it costs.
+ *
+ * ## Why it is safe
+ *
+ * Three things make it so, and all three are load-bearing:
+ *
+ *  1. **The queue must be empty.** Dispatching a SETUP while earlier events are
+ *     still queued would reorder it ahead of them -- in particular ahead of the
+ *     XFER_COMPLETE that ends the PREVIOUS request, whose completion callback would
+ *     then run against the new request's control state.
+ *
+ *  2. **No mutual exclusion problem with tud_task().** osal_queue_receive()
+ *     brackets its FIFO access by disabling the USB interrupt, so this handler
+ *     cannot possibly run while tud_task() is between the two. The serialisation is
+ *     done by the interrupt controller rather than by a lock, which is also why
+ *     nothing here needs one.
+ *
+ *  3. **The handlers touch no DMAC.** Both requests are chosen because their steady
+ *     state is a few stores: staging hands an address to the USB peripheral's own
+ *     DMA, and a discarding scan records its parameters for the main loop. Neither
+ *     selects a DMAC channel, and jtag_{stage,scan}_isr_safe() refuse exactly the
+ *     cases that would -- the CHID window is a single register and re-pointing it
+ *     under the main loop's own sequence would retarget its next write.
+ *
+ * What is deliberately NOT here: any actual JTAG clocking. jtag_scan_task() still
+ * does that from the main loop.
+ */
+// noinline: this is called from dcd_int_handler(), and letting LTO inline it there
+// grew USB_Handler by 148 bytes for no benefit -- the ISR is not hot enough in
+// instruction count for a call to matter, and flash here has 728 bytes free.
+__attribute__((noinline))
+bool dcd_setup_fast_path(uint8_t rhport, uint8_t const* setup)
+{
+	tusb_control_request_t const* request = (tusb_control_request_t const*) (void const*) setup;
+
+	// Only vendor requests; a standard or class request reaches state this knows
+	// nothing about.
+	if (request->bmRequestType_bit.type != TUSB_REQ_TYPE_VENDOR) {
+		return false;
+	}
+
+	// Reason 1 above. Cheap, and checked before anything else that could have an
+	// effect.
+	if (!usbd_event_queue_empty()) {
+		return false;
+	}
+
+	// The two requests a bitstream download issues per chunk, and nothing else. Every
+	// other request keeps its old path: this is a fast path for the hot pair, not a
+	// second dispatcher.
+	if (request->bRequest != VENDOR_REQUEST_JTAG_SET_OUT_BUFFER
+			&& request->bRequest != VENDOR_REQUEST_JTAG_SCAN) {
+		return false;
+	}
+
+	// Reason 3 above. Passes wIndex and wValue whole rather than decoded flags: the
+	// flag bits are jtag.c's to interpret, and it already does so for the real
+	// handler.
+	if (!jtag_request_isr_safe(request->bRequest == VENDOR_REQUEST_JTAG_SCAN,
+	                           request->wValue, request->wIndex,
+	                           request->wLength)) {
+		return false;
+	}
+
+	// Run the identical sequence tud_task() would have run. Reusing it rather than
+	// open-coding the dispatch is what keeps the two paths from drifting: the
+	// programming-state gate, the complete-callback registration and the stall on
+	// refusal all still apply.
+	usbd_handle_setup(rhport, request);
+	return true;
 }

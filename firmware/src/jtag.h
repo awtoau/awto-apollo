@@ -101,6 +101,17 @@ uint8_t *jtag_fill_buffer(void);
 bool jtag_scan_pending(void);
 
 /**
+ * Whether a SET_OUT_BUFFER (is_scan false) or SCAN (is_scan true) of these
+ * parameters can be handled in USB interrupt context, i.e. without reaching the
+ * DMAC's shared CHID window.
+ *
+ * See the definition in jtag.c for the reasoning. A false answer is always safe: the
+ * request falls back to the queued path and costs the latency it always did.
+ */
+bool jtag_request_isr_safe(bool is_scan, uint16_t wValue, uint16_t wIndex,
+                           uint16_t wLength);
+
+/**
  * Advances a scan queued by handle_jtag_request_scan(), if there is one.
  *
  * Called from the main loop rather than from the request handler: the handler

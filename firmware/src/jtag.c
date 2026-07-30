@@ -143,6 +143,18 @@ static struct {
 static volatile bool     staged_valid = false;
 static volatile uint16_t staged_bytes = 0;
 
+// Whether jtag_scan_task() is inside its non-re-entrant region.
+//
+// Exists only for the USB-interrupt fast path, which must refuse to run a request
+// handler while the main loop is part-way through reading queued_scan and driving the
+// DMAC. `pending` cannot serve: it is true across the whole window this protects,
+// which is exactly why checking it was not enough.
+//
+// volatile because the ISR reads what the main loop writes. The SAMD11 is single-core
+// with no store buffer, so that is sufficient -- there is nothing to fence against,
+// only a compiler that would otherwise keep the value in a register.
+static volatile bool scan_task_busy = false;
+
 
 /**
  * The buffer the host is currently staging into.
@@ -189,6 +201,114 @@ enum {
         // transmit buffer affordable.
         FLAG_DISCARD_TDO   = 0b100
 };
+
+
+/**
+ * Whether SET_OUT_BUFFER or SCAN, as described by this request, can be serviced
+ * from the USB interrupt rather than from the main loop.
+ *
+ * ## The hazard being avoided
+ *
+ * Exactly one thing makes either handler unsafe in interrupt context: the
+ * jtag_scan_drain() it may call. That runs jtag_scan_task(), which reaches
+ * spi_send_done() and jtag_scan_start(), and both select a DMAC channel through the
+ * single CHID register window. The main loop may be part-way through its own CHID
+ * sequence when the interrupt lands, so re-pointing CHID underneath it would
+ * silently retarget its next register write to the wrong channel -- which presents
+ * as lost data rather than as a fault.
+ *
+ * So for both requests the question is the same: "would this drain?"
+ *
+ * ## SET_OUT_BUFFER
+ *
+ * Drains when the buffer it is about to fill is the one a queued scan is clocking.
+ * The size-driven reassignment in the handler has to be replayed here, because it
+ * decides WHICH buffer that is -- testing the current fill_is_alt without it would
+ * answer for the wrong buffer whenever a large chunk is about to displace a small
+ * one.
+ *
+ * ## SCAN
+ *
+ * Only the discarding scan, and only with nothing already queued:
+ *
+ *  - A CAPTURING scan drains and then clocks inline, so it touches the DMAC
+ *    directly. It is also not on the hot path -- a configure is hundreds of
+ *    discarding chunks and a handful of capturing reads.
+ *  - A discarding scan with one already pending drains, to keep the queue depth at
+ *    one.
+ *
+ * What remains records six fields and returns, touching no hardware at all: the
+ * arming is left to jtag_scan_task() in the main loop, exactly as before. That is
+ * what makes it safe rather than merely short.
+ *
+ * ## In the steady state
+ *
+ * Both are true, which is the point: the host stages one buffer while the other
+ * clocks, so neither request drains. A false answer is always safe -- the request
+ * falls back to the queued path and costs exactly what it used to.
+ *
+ * Both requests share one function because they share the `pending` load and the
+ * decision structure, and because the only caller is dcd_setup_fast_path(). Two
+ * functions measured 60 bytes more on a part with 197 to spend.
+ */
+// is_scan rather than the request number: the vendor request IDs live in vendor.c
+// and this file has no business knowing them.
+bool jtag_request_isr_safe(bool is_scan, uint16_t wValue, uint16_t wIndex,
+                           uint16_t wLength)
+{
+	// Refuse outright while the main loop is inside jtag_scan_task().
+	//
+	// This is the check that took the failure rate from 14-of-30 to zero, and it is
+	// NOT implied by the `pending` tests below. jtag_scan_task() reads queued_scan
+	// field by field and drives the DMAC, none of it atomically; a handler running in
+	// that window arms a scan from a descriptor that is half old and half new.
+	// `pending` is true throughout that window, so it cannot distinguish it.
+	if (scan_task_busy) {
+		return false;
+	}
+
+	// Cheapest discriminator first: a scan with nothing queued and a stage with
+	// nothing queued are both safe, so the pending case is the only one needing
+	// per-request reasoning.
+	bool pending = queued_scan.pending;
+
+	if (is_scan) {
+		if (!(wIndex & FLAG_DISCARD_TDO) || pending) {
+			return false;
+		}
+		// Leave the refusal of a malformed request to the queued path, so the
+		// validation has exactly one home.
+		return wValue != 0 && (wValue / 8) <= jtag_fill_capacity();
+	}
+
+	// SET_OUT_BUFFER. Oversized requests stall, and the stall path is safe -- but
+	// again, let the queued path answer them.
+	if (wLength > JTAG_BUFFER_SIZE) {
+		return false;
+	}
+	if (!pending) {
+		return true;
+	}
+
+	// Replay the reassignment, INCLUDING its `&& fill_is_alt` guard.
+	//
+	// The guard is not redundant, and dropping it is a bug that took a hardware
+	// pipe error to find: without it a large chunk arriving while fill_is_alt is
+	// already false computes target_alt = false, matches a queued scan whose
+	// from_alt is also false, and declares the request unsafe -- when in fact the
+	// handler would not have drained at all. The reverse also bites: it made the
+	// answer depend on chunk size in a way the handler's own logic does not, so a
+	// 512-byte run followed by a 1024-byte run stalled where either alone was fine.
+	//
+	// This must mirror handle_jtag_request_set_out_buffer() exactly. Any divergence
+	// is a wrong answer about whether that function will touch the DMAC.
+	bool target_alt = fill_is_alt;
+	if (wLength > JTAG_ALT_BUFFER_SIZE && target_alt) {
+		target_alt = false;
+	}
+
+	return target_alt != queued_scan.from_alt;
+}
 
 
 /**
@@ -603,6 +723,19 @@ void jtag_scan_task(void)
 		return;
 	}
 
+	// Close the USB-interrupt fast path for the whole of what follows.
+	//
+	// Everything below reads queued_scan field by field and touches the DMAC, and
+	// none of it is atomic. A fast-path handler firing in here would overwrite
+	// queued_scan.from_alt and num_bits and flip fill_is_alt, leaving this to arm a
+	// scan from a half-updated descriptor. Set before the first read and cleared on
+	// every exit, so the guarded region is the entire sequence.
+	//
+	// Measured: without this the shift path failed 14 of 30 alternating-size runs,
+	// while passing three consecutive single-size benchmark runs. See
+	// scripts/jtag_isr_soak.py for why the alternation is what exposes it.
+	scan_task_busy = true;
+
 	// First visit for this scan: arm it and get straight back to the main loop, so
 	// tud_task() runs while the DMAC clocks. That return is the whole point -- the
 	// old code spun here for the entire transfer and the device NAKed throughout.
@@ -614,6 +747,7 @@ void jtag_scan_task(void)
 			// unreachable. Drop it rather than retrying forever: the main loop has
 			// no control transfer left to stall.
 			queued_scan.pending = false;
+			scan_task_busy = false;
 			return;
 		}
 		queued_scan.started = true;
@@ -622,6 +756,7 @@ void jtag_scan_task(void)
 	// Subsequent visits: one register read to ask whether the wire is clear. Cheap
 	// enough to do on every loop pass, which is what replaces the 700 us spin.
 	if (!jtag_scan_finish_step()) {
+		scan_task_busy = false;
 		return;
 	}
 
@@ -629,6 +764,7 @@ void jtag_scan_task(void)
 	// Cleared last, so that a SET_OUT_BUFFER arriving during the clocking above sees
 	// the scan as still pending and waits if it targets this buffer.
 	queued_scan.pending = false;
+	scan_task_busy = false;
 }
 
 
