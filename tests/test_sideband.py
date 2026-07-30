@@ -26,7 +26,7 @@ from apollo_fpga.gateware.sideband import (
     SidebandResponder, CMD_PING, CMD_STATUS, CMD_POWER, CMD_DEVICES,
     CMD_LED_RELEASE,
     STATUS_OK, STATUS_HEARTBEAT, STATUS_EVENTS, PROTOCOL_VERSION,
-    CMD_LED_BASE,
+    CMD_LED_BASE, PAYLOAD_SIZE, MAX_PAYLOAD, FIRMWARE_ADV_RESPONSE_MAX,
 )
 
 
@@ -473,6 +473,450 @@ class SidebandTest(unittest.TestCase):
         sim.run()
         self.assertTrue(all(s == 0 for s in samples),
                         "tx_active asserted while idle")
+
+
+class LineOwnershipTest(unittest.TestCase):
+    """ Who is allowed to drive FPGA_ADV, and when.
+
+    FPGA_ADV is a single wire with a CMOS driver at each end. Driving it
+    push-pull at both ends means any timing slip that enables both drivers at
+    once puts a driven high against a driven low: a low-impedance path through
+    two output stages, and a hardware-damage risk rather than a link-reliability
+    one. These tests measure the shared wire with both drivers modelled, so the
+    claim is reproduced rather than reasoned about.
+
+    Every test here has a push-pull counterpart that fails the same assertion --
+    the positive control. Without it, a test that passes proves only that the
+    test cannot detect the fault.
+    """
+
+    def _overlap(self, *, open_drain, master_open_drain, overlap_bits):
+        """Have the master retry on top of a reply; count shorted cycles.
+
+        A short needs a source and a sink -- one end driving high into the other
+        driving low. Two ends pulling low together is just a low, which is the
+        entire argument for open-drain, so "both drivers enabled" is not the
+        thing to count.
+        """
+        dut = SidebandResponder(clk_freq_hz=CLK_HZ, baud=BAUD,
+                                open_drain=open_drain)
+        m = Module()
+        m.submodules.dut = dut
+        sim = Simulator(m)
+        sim.add_clock(1 / CLK_HZ)
+
+        counts = {"both": 0, "shorted": 0}
+
+        async def drive(ctx):
+            frame = [0] + [(CMD_STATUS >> i) & 1 for i in range(8)] + [1]
+
+            ctx.set(dut.rx, 1)
+            for _ in range(DIVISOR * 2):
+                await ctx.tick()
+
+            # The command.
+            for bit in frame:
+                ctx.set(dut.rx, bit)
+                for _ in range(DIVISOR):
+                    await ctx.tick()
+            ctx.set(dut.rx, 1)
+
+            # The master gives up early and retries, landing on a reply that is
+            # still going out. This is the #99 timeout-retry case seen from the
+            # electrical side.
+            for _ in range(overlap_bits * DIVISOR):
+                await ctx.tick()
+
+            for bit in frame:
+                ctx.set(dut.rx, bit)
+                for _ in range(DIVISOR):
+                    await ctx.tick()
+                    fpga_oe = ctx.get(dut.pad_oe)
+                    # An open-drain master only enables its driver for a low bit.
+                    master_oe = (bit == 0) if master_open_drain else True
+                    if fpga_oe and master_oe:
+                        counts["both"] += 1
+                        if ctx.get(dut.pad_o) != bit:
+                            counts["shorted"] += 1
+
+        sim.add_testbench(drive)
+        sim.run()
+        return counts
+
+    # Overlaps to try. 1 and 2 bit times land in the turnaround and the status
+    # byte; 8 and 12 land well inside the reply, where the responder is driving
+    # continuously and a retry has the most to collide with.
+    OVERLAPS = (1, 2, 4, 8, 12)
+
+    def test_open_drain_both_ends_cannot_short(self):
+        """The fix: with both ends open-drain, no overlap can short.
+
+        This is the state the design was meant to be in.
+        """
+        for overlap in self.OVERLAPS:
+            counts = self._overlap(open_drain=True, master_open_drain=True,
+                                   overlap_bits=overlap)
+            self.assertGreater(counts["both"], 0,
+                               f"overlap {overlap}: the drivers never both "
+                               f"enabled, so this proves nothing -- the test "
+                               f"is not exercising a collision at all")
+            self.assertEqual(counts["shorted"], 0,
+                             f"overlap {overlap}: {counts['shorted']} cycles "
+                             f"of driven-high into driven-low with both ends "
+                             f"open-drain, which should be impossible")
+
+    def test_push_pull_both_ends_does_short(self):
+        """Positive control for the test above.
+
+        If this passes with zero shorts, the detector is broken and the
+        open-drain result means nothing.
+        """
+        worst = 0
+        for overlap in self.OVERLAPS:
+            counts = self._overlap(open_drain=False, master_open_drain=False,
+                                   overlap_bits=overlap)
+            worst = max(worst, counts["shorted"])
+        self.assertGreater(worst, 0,
+                           "push-pull at both ends produced no shorted cycles; "
+                           "the detector cannot see the fault it is meant to "
+                           "prove is fixed")
+
+    def test_fixing_one_end_only_is_not_enough(self):
+        """Both ends must change, which is why the firmware changed too.
+
+        An open-drain FPGA still shorts against a push-pull master, and a
+        push-pull FPGA still shorts against an open-drain master. Recorded as a
+        test so a future change that reverts one side alone fails here rather
+        than on a bench.
+        """
+        for open_drain, master_open_drain, label in (
+                (True, False, "FPGA open-drain, master push-pull"),
+                (False, True, "FPGA push-pull, master open-drain")):
+            worst = 0
+            for overlap in self.OVERLAPS:
+                counts = self._overlap(open_drain=open_drain,
+                                       master_open_drain=master_open_drain,
+                                       overlap_bits=overlap)
+                worst = max(worst, counts["shorted"])
+            self.assertGreater(
+                worst, 0,
+                f"{label}: expected shorted cycles, since only one end is "
+                f"open-drain -- if this is now zero the model has changed and "
+                f"the reasoning behind the firmware change needs revisiting")
+
+    def test_open_drain_never_drives_high(self):
+        """The defining property: the driver is enabled only to pull low.
+
+        Checked over a full 18-byte reply, which contains high bits, low bits,
+        start bits, stop bits and the idle lead-in -- so any state that drives
+        high shows up.
+        """
+        dut = SidebandResponder(clk_freq_hz=CLK_HZ, baud=BAUD, open_drain=True)
+        m = Module()
+        m.submodules.dut = dut
+        sim = Simulator(m)
+        sim.add_clock(1 / CLK_HZ)
+        driven_high = []
+
+        async def drive(ctx):
+            ctx.set(dut.rx, 1)
+            for _ in range(DIVISOR * 2):
+                await ctx.tick()
+            for bit in [0] + [(CMD_POWER >> i) & 1 for i in range(8)] + [1]:
+                ctx.set(dut.rx, bit)
+                for _ in range(DIVISOR):
+                    await ctx.tick()
+            ctx.set(dut.rx, 1)
+            for _ in range(DIVISOR * 10 * 24):
+                await ctx.tick()
+                if ctx.get(dut.pad_oe) and ctx.get(dut.pad_o):
+                    driven_high.append(1)
+
+        sim.add_testbench(drive)
+        sim.run()
+        self.assertEqual(len(driven_high), 0,
+                         f"the open-drain driver sourced current on "
+                         f"{len(driven_high)} cycles; it must only ever sink")
+
+    def test_push_pull_drives_high_before_the_start_bit(self):
+        """Positive control, and the specific window that made #88 concrete.
+
+        tx_active asserts a SETTLE plus a LOAD ahead of the first bit reaching
+        the wire, so oe = tx_active with o = tx claims the line by driving it
+        HIGH for that lead-in -- while the master's own driver may still be
+        enabled. This records that the lead-in exists and is non-zero.
+        """
+        dut = SidebandResponder(clk_freq_hz=CLK_HZ, baud=BAUD, open_drain=False)
+        m = Module()
+        m.submodules.dut = dut
+        sim = Simulator(m)
+        sim.add_clock(1 / CLK_HZ)
+        trace = []
+
+        async def drive(ctx):
+            ctx.set(dut.rx, 1)
+            for _ in range(DIVISOR * 2):
+                await ctx.tick()
+            for bit in [0] + [(CMD_STATUS >> i) & 1 for i in range(8)] + [1]:
+                ctx.set(dut.rx, bit)
+                for _ in range(DIVISOR):
+                    await ctx.tick()
+            ctx.set(dut.rx, 1)
+            for _ in range(DIVISOR * 10 * 6):
+                await ctx.tick()
+                trace.append((ctx.get(dut.pad_oe), ctx.get(dut.pad_o)))
+
+        sim.add_testbench(drive)
+        sim.run()
+
+        first_enabled = next(i for i, (oe, _) in enumerate(trace) if oe)
+        first_low = next(i for i, (oe, o) in enumerate(trace) if oe and not o)
+        self.assertGreater(
+            first_low - first_enabled, 0,
+            "expected the push-pull driver to be enabled while still driving "
+            "high, before the start bit -- if this is now zero the FSM's "
+            "SETTLE/LOAD timing changed and the #88 rationale should be re-read")
+
+    def test_idle_releases_the_line_entirely(self):
+        """With no command pending, the FPGA must not drive at all.
+
+        Weaker than idling high: a driver held enabled at high would stop Apollo
+        pulling the line low, and no command would ever arrive.
+        """
+        for open_drain in (True, False):
+            dut = SidebandResponder(clk_freq_hz=CLK_HZ, baud=BAUD,
+                                    open_drain=open_drain)
+            m = Module()
+            m.submodules.dut = dut
+            sim = Simulator(m)
+            sim.add_clock(1 / CLK_HZ)
+            enabled = []
+
+            async def idle(ctx):
+                ctx.set(dut.rx, 1)
+                for _ in range(DIVISOR * 20):
+                    await ctx.tick()
+                    enabled.append(ctx.get(dut.pad_oe))
+
+            sim.add_testbench(idle)
+            sim.run()
+            self.assertFalse(any(enabled),
+                             f"open_drain={open_drain}: the driver was enabled "
+                             f"with no command pending")
+
+    def test_open_drain_reply_is_still_decodable(self):
+        """Open-drain must not change what is on the wire, only how.
+
+        A pull-up-and-release line reads identically to a driven one at the
+        receiver: released is high. Reconstructing the wire from pad_o/pad_oe --
+        low when driven low, high when released -- must decode to the same reply
+        the push-pull build produces. Otherwise the fix for #88 breaks the link
+        it protects.
+        """
+        def reply(open_drain):
+            dut = SidebandResponder(clk_freq_hz=CLK_HZ, baud=BAUD,
+                                    open_drain=open_drain)
+            m = Module()
+            m.submodules.dut = dut
+            sim = Simulator(m)
+            sim.add_clock(1 / CLK_HZ)
+            wire = []
+
+            async def drive(ctx):
+                def sample():
+                    # The wire: driven low pulls it low, anything else is the
+                    # pull-ups holding it high.
+                    if ctx.get(dut.pad_oe) and not ctx.get(dut.pad_o):
+                        return 0
+                    return 1
+
+                ctx.set(dut.rx, 1)
+                for _ in range(DIVISOR * 2):
+                    await ctx.tick()
+                    wire.append(sample())
+                for bit in [0] + [(CMD_POWER >> i) & 1 for i in range(8)] + [1]:
+                    ctx.set(dut.rx, bit)
+                    for _ in range(DIVISOR):
+                        await ctx.tick()
+                        wire.append(sample())
+                ctx.set(dut.rx, 1)
+                for _ in range(DIVISOR * 10 * 24):
+                    await ctx.tick()
+                    wire.append(sample())
+
+            sim.add_testbench(drive)
+            sim.run()
+            return SidebandTest._decode(wire)
+
+        open_drain_reply = reply(True)
+        push_pull_reply = reply(False)
+        self.assertEqual(len(open_drain_reply), 18,
+                         f"open-drain reply was {len(open_drain_reply)} bytes, "
+                         f"expected 18: {[hex(b) for b in open_drain_reply]}")
+        self.assertEqual(open_drain_reply, push_pull_reply,
+                         "open-drain and push-pull put different bytes on the "
+                         "wire; the drive style must not change the protocol")
+
+
+class RetryCorruptionTest(unittest.TestCase):
+    """ What the responder does with a command that arrives mid-response.
+
+    The firmware's timeout-retry bug depends on this: if a retry sent during a
+    reply were queued and answered, the master would get a second reply and the
+    counts would work out. It is not -- the responder forces its receiver
+    idle-high for the whole of its own transmission, so the retry is not
+    rejected, it is never received at all. The master therefore re-arms its
+    collector against bytes still in flight from the FIRST reply, and assembles a
+    full-length response out of them.
+
+    That is why the fix is to drain the receiver before re-arming, and not to add
+    framing or a sequence number.
+    """
+
+    def _send_two(self, gap_bits):
+        """Send a command, then another `gap_bits` bit times later.
+
+        Returns the decoded replies. A single reply means the second command was
+        swallowed; two means it was received.
+        """
+        dut = SidebandResponder(clk_freq_hz=CLK_HZ, baud=BAUD)
+        m = Module()
+        m.submodules.dut = dut
+        sim = Simulator(m)
+        sim.add_clock(1 / CLK_HZ)
+        wire = []
+        strobes = []
+
+        async def drive(ctx):
+            def sample():
+                if ctx.get(dut.pad_oe) and not ctx.get(dut.pad_o):
+                    return 0
+                return 1
+
+            async def send(command):
+                for bit in ([0] + [(command >> i) & 1 for i in range(8)] + [1]):
+                    ctx.set(dut.rx, bit)
+                    for _ in range(DIVISOR):
+                        await ctx.tick()
+                        wire.append(sample())
+                        if ctx.get(dut.rx_strobe):
+                            strobes.append(ctx.get(dut.rx_byte))
+                ctx.set(dut.rx, 1)
+
+            ctx.set(dut.rx, 1)
+            for _ in range(DIVISOR * 2):
+                await ctx.tick()
+                wire.append(sample())
+
+            # First command: POWER, the longest reply, so there is plenty of
+            # response still in flight to collide with.
+            await send(CMD_POWER)
+
+            for _ in range(gap_bits * DIVISOR):
+                await ctx.tick()
+                wire.append(sample())
+                if ctx.get(dut.rx_strobe):
+                    strobes.append(ctx.get(dut.rx_byte))
+
+            # The retry.
+            await send(CMD_STATUS)
+
+            # Long enough for both replies, had both been answered.
+            for _ in range(DIVISOR * 10 * 44):
+                await ctx.tick()
+                wire.append(sample())
+                if ctx.get(dut.rx_strobe):
+                    strobes.append(ctx.get(dut.rx_byte))
+
+        sim.add_testbench(drive)
+        sim.run()
+        return SidebandTest._decode(wire), strobes
+
+    def test_a_retry_during_a_reply_is_never_received(self):
+        """The retry is swallowed, not answered.
+
+        4 bit times after the command is well inside the reply. If the responder
+        saw it, there would be a second STATUS reply on the wire and a second
+        strobe; there is neither.
+        """
+        replies, strobes = self._send_two(gap_bits=4)
+        self.assertEqual(strobes, [CMD_POWER],
+                         f"expected only the first command to be received, got "
+                         f"{[hex(b) for b in strobes]} -- if CMD_STATUS appears "
+                         f"here the responder is no longer deaf during its own "
+                         f"transmission and the firmware's drain-before-arm "
+                         f"reasoning needs revisiting")
+        # One 18-byte reply, not two replies.
+        self.assertEqual(len(replies), 18,
+                         f"expected a single 18-byte reply, got {len(replies)} "
+                         f"bytes: {[hex(b) for b in replies]}")
+
+    def test_a_command_after_the_reply_is_received(self):
+        """Control: once the line is quiet again, commands land normally.
+
+        Without this the test above could pass simply because the harness never
+        delivers a second command at all.
+        """
+        # 220 bit times is comfortably past an 18-byte reply plus turnaround.
+        replies, strobes = self._send_two(gap_bits=220)
+        self.assertEqual(strobes, [CMD_POWER, CMD_STATUS],
+                         f"a command sent well after the reply should be "
+                         f"received; got {[hex(b) for b in strobes]}")
+        self.assertEqual(len(replies), 20,
+                         f"expected an 18-byte and a 2-byte reply, got "
+                         f"{len(replies)} bytes")
+
+
+class PayloadWidthTest(unittest.TestCase):
+    """ The gateware's payload width against the firmware's response buffer.
+
+    These were two independent numbers -- payload_len as range(17) here and
+    ADV_RESPONSE_MAX as 18 in the firmware -- with nothing tying them together
+    and zero headroom. A 17-byte command would have truncated silently in
+    gateware while firmware accepted the longer reply.
+    """
+
+    def test_every_payload_fits_the_firmware_buffer(self):
+        """The assertion that now runs at elaboration, checked directly."""
+        for command, size in PAYLOAD_SIZE.items():
+            self.assertLessEqual(
+                size, MAX_PAYLOAD,
+                f"command {command:#04x} declares a {size}-byte payload, but "
+                f"the firmware's {FIRMWARE_ADV_RESPONSE_MAX}-byte buffer can "
+                f"only carry {MAX_PAYLOAD} (status + payload + CRC)")
+
+    def test_the_assertion_actually_fires(self):
+        """Positive control: an oversized payload must fail elaboration.
+
+        Without this, the assertion could be unreachable and the test above
+        would still pass.
+        """
+        from amaranth.hdl import Fragment
+        import apollo_fpga.gateware.sideband as sideband
+
+        original = dict(sideband.PAYLOAD_SIZE)
+        try:
+            # One byte too many for the firmware's buffer.
+            sideband.PAYLOAD_SIZE[0xFE] = MAX_PAYLOAD + 1
+            with self.assertRaises(AssertionError):
+                Fragment.get(SidebandResponder(clk_freq_hz=CLK_HZ, baud=BAUD),
+                             None)
+        finally:
+            sideband.PAYLOAD_SIZE.clear()
+            sideband.PAYLOAD_SIZE.update(original)
+
+    def test_payload_len_has_headroom(self):
+        """payload_len must be able to hold MAX_PAYLOAD, not merely the largest
+        payload in use -- otherwise the assertion guards a register that cannot
+        represent the limit it checks against."""
+        self.assertGreaterEqual(MAX_PAYLOAD, max(PAYLOAD_SIZE.values()))
+        # And the widened register must still transmit the largest reply, so the
+        # width change is not merely bigger but correct.
+        response = SidebandTest("test_power_returns_sixteen_bytes")._run(
+            CMD_POWER, power_data=0)
+        self.assertEqual(len(response), 18,
+                         f"largest reply came back as {len(response)} bytes "
+                         f"after widening payload_len")
 
 
 if __name__ == "__main__":

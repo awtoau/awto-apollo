@@ -67,12 +67,26 @@ STATUS_HEARTBEAT   = 6
 
 PROTOCOL_VERSION = 0x01
 
+# The firmware's response buffer size, from ADV_RESPONSE_MAX in
+# firmware/src/boards/cynthion_d11/fpga_adv.c. A reply is status + payload +
+# CRC, so the largest payload this buffer can carry is ADV_RESPONSE_MAX - 2.
+#
+# Duplicated rather than shared because one side is C on a Cortex-M0+ and the
+# other is Python, and there is no build step that sees both. The assertion in
+# SidebandResponder.elaborate() is what makes the duplication safe: adding a
+# 17-byte command here would otherwise truncate silently in gateware while
+# firmware happily accepted the longer reply, and nothing tied the two numbers
+# together.
+FIRMWARE_ADV_RESPONSE_MAX = 18
+MAX_PAYLOAD = FIRMWARE_ADV_RESPONSE_MAX - 2
+
 
 class CRC8(Elaboratable):
     """ CRC-8/ATM: polynomial 0x07, init 0x00, no reflection, no final XOR.
 
-    One byte at a time, eight shifts per clock. At 115200 baud a byte takes
-    ~87 us, so an eight-deep combinational chain is never the critical path.
+    One byte at a time, eight shifts per clock. At the link's 230400 baud a byte
+    takes ~43 us, so an eight-deep combinational chain is never the critical
+    path.
     """
 
     def __init__(self):
@@ -212,6 +226,8 @@ class SidebandResponder(Elaboratable):
         I: rx           -- the FPGA_ADV line, as an input
         O: tx           -- what to drive on FPGA_ADV
         O: tx_active    -- high while transmitting, for tri-state control
+        O: pad_o        -- wire straight to pad.o; respects open_drain
+        O: pad_oe       -- wire straight to pad.oe; respects open_drain
         I: power_data   -- 128 bits: VBUS[0..3] then VSENSE[0..3], LE16 each
         I: events       -- events pending
         I: error        -- error flag
@@ -219,7 +235,12 @@ class SidebandResponder(Elaboratable):
         I: state        -- 2-bit FPGA state
     """
 
-    def __init__(self, clk_freq_hz=60e6, baud=115200, turnaround_us=40):
+    # baud defaults to 230400, matching ADV_UART_BAUD in the Apollo firmware.
+    # A mismatch here kills the link silently -- both ends simply never frame a
+    # byte, with no error raised anywhere -- so the default must be the shipping
+    # rate rather than the historical one.
+    def __init__(self, clk_freq_hz=60e6, baud=230400, turnaround_us=40,
+                 open_drain=True):
         # The bit period is a cycle count fixed at build time, so this module is
         # only correct if the domain it ends up in really runs at clk_freq_hz.
         # Nothing checks that at elaboration: a design that raises its sync
@@ -256,9 +277,36 @@ class SidebandResponder(Elaboratable):
         # 115200, 92% at 230400, 0% above.
         self.turnaround_cycles = max(int(clk_freq_hz * turnaround_us / 1e6), 1)
 
+        # Open-drain by default: the FPGA only ever pulls FPGA_ADV low and lets
+        # the pull-ups raise it. See pad_o/pad_oe below for why that is the
+        # default rather than an option.
+        self.open_drain = open_drain
+
         self.rx           = Signal(init=1)
         self.tx           = Signal(init=1)
         self.tx_active    = Signal()
+
+        # Drive FPGA_ADV through these, not through tx/tx_active.
+        #
+        # FPGA_ADV is one wire with a CMOS driver at each end. Driving it
+        # push-pull means a timing slip that enables both drivers at once puts a
+        # driven high against a driven low: a low-impedance path through two
+        # output stages, tens to hundreds of milliamps, and a hardware-damage
+        # risk rather than a link-reliability one. Open-drain removes the
+        # possibility rather than narrowing the window -- two drivers pulling
+        # low together is just a low.
+        #
+        # The gap this closes is not hypothetical. tx_active asserts one full
+        # SETTLE-plus-LOAD ahead of the first bit reaching the wire, so
+        # oe = tx_active with o = tx drives the line HIGH for that lead-in,
+        # while the master's own driver may still be enabled. Measured at 0.75
+        # bit times by scripts/sideband_contention_probe.py.
+        #
+        # Exposed as pad signals rather than left to each consumer: every
+        # consumer that wired oe = tx_active got push-pull by accident, and the
+        # decision belongs in one place.
+        self.pad_o        = Signal()
+        self.pad_oe       = Signal()
 
         self.power_data   = Signal(128)
 
@@ -330,6 +378,56 @@ class SidebandResponder(Elaboratable):
         ]
         m.d.comb += self.tx.eq(tx_uart.tx)
 
+        # Pad driving, and the whole of issue #88 in four lines.
+        #
+        # Open-drain: never drive high, only pull low, and only while we own the
+        # line. oe therefore tracks the bit value, not merely tx_active, so the
+        # driver is off for every high bit and for the entire lead-in before the
+        # start bit. Contention becomes impossible by construction: whatever the
+        # master does, the worst case is two drivers pulling the same wire low.
+        #
+        # Push-pull is kept reachable, because open-drain trades drive strength
+        # for rise time and that trade has NOT been measured on this board.
+        #
+        # The falling edge is unchanged -- an active pull-down either way. The
+        # rising edge stops being a driven transition and becomes an RC against
+        # the two internal pull-ups in parallel. Order of magnitude, and this is
+        # arithmetic rather than measurement:
+        #
+        #   Apollo's PA09 pull is specified 20/40/60 kOhm. The ECP5's is a weak
+        #   current source of tens of microamps, not a stated resistance, so the
+        #   parallel figure is unknown but bounded below by the SAMD11's worst
+        #   case: >= 60 kOhm is pessimistic, ~20 kOhm optimistic. Load is the two
+        #   pin capacitances plus the trace, call it 15-25 pF. One RC is then
+        #   0.3-1.5 us, and reaching a CMOS threshold takes roughly one RC.
+        #
+        #   At 230400 baud a bit is 4.34 us, so 0.3-1.5 us of rise is 7-35% of a
+        #   bit. The receiver samples at bit centre, so the low end is
+        #   comfortable and the high end is marginal. At 115200 (8.68 us bits)
+        #   the same rise is 3-17% and comfortable throughout.
+        #
+        # That spread is why this is a real risk and not a formality: the
+        # pessimistic end of an unmeasured range lands close enough to matter at
+        # 230400. It cannot be settled in simulation -- it needs a scope on T6,
+        # or the open-drain build of ecp5-test/adv_speed, which exists precisely
+        # to find the crossover and whose result was never applied.
+        #
+        # Correctness wins over rate here regardless: push-pull at both ends is a
+        # hardware-damage path, and dropping to 115200 is a recoverable cost
+        # where a shorted driver is not. If the link proves marginal at 230400
+        # once open-drain, drop BOTH sides to 115200 together -- see the baud
+        # note on __init__.
+        if self.open_drain:
+            m.d.comb += [
+                self.pad_o.eq(0),
+                self.pad_oe.eq(self.tx_active & ~self.tx),
+            ]
+        else:
+            m.d.comb += [
+                self.pad_o.eq(self.tx),
+                self.pad_oe.eq(self.tx_active),
+            ]
+
         # Flips on every response: a value that *changes* proves the responder
         # is executing, where a repeated value could be a wedged state machine
         # replaying a stale buffer.
@@ -386,9 +484,26 @@ class SidebandResponder(Elaboratable):
 
         # Payload bytes for the command in flight. Sized for the largest
         # response so one register file serves all commands.
+        #
+        # Widths derive from MAX_PAYLOAD rather than being written out, and the
+        # assertion is what ties this side to the firmware's buffer. Previously
+        # payload_len was range(17) against a largest payload of 16 -- correct,
+        # but with zero headroom and nothing checking it, so a 17-byte command
+        # would have truncated here while firmware accepted the longer reply.
+        # This is an elaboration-time failure rather than a wrong bitstream.
+        largest = max(PAYLOAD_SIZE.values())
+        assert largest <= MAX_PAYLOAD, (
+            f"largest payload {largest} exceeds what the firmware's "
+            f"{FIRMWARE_ADV_RESPONSE_MAX}-byte response buffer can carry "
+            f"({MAX_PAYLOAD}); raise ADV_RESPONSE_MAX in "
+            f"firmware/src/boards/cynthion_d11/fpga_adv.c and "
+            f"FIRMWARE_ADV_RESPONSE_MAX here together")
+
         turnaround  = Signal(range(self.turnaround_cycles + 1))
-        payload_len = Signal(range(17))
-        byte_index  = Signal(range(19))
+        # +1 so payload_len can hold MAX_PAYLOAD itself.
+        payload_len = Signal(range(MAX_PAYLOAD + 1))
+        # Counts status + payload + CRC, so it must reach the full reply length.
+        byte_index  = Signal(range(FIRMWARE_ADV_RESPONSE_MAX + 1))
         send_byte   = Signal(8)
 
         # PING's payload; POWER's comes from power_data.

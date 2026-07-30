@@ -26,7 +26,13 @@ typedef enum {
 	// Count rising edges in a time window (original mechanism).
 	FPGA_ADV_MODE_EIC  = 0,
 
-	// Parse a framed heartbeat from a 1 Mbaud receive-only UART.
+	// Parse a framed heartbeat from a 230400-baud receive-only UART.
+	//
+	// 230400, not the 1 Mbaud this once said: at 1 us bits there is no margin
+	// left for a USB interrupt to stretch a bit-banged transmit past the
+	// receiver's sample point. See ADV_UART_BAUD in the cynthion_d11 board file
+	// for the measurements. The responder gateware must be built at the same
+	// rate -- a mismatch kills the link silently rather than degrading it.
 	FPGA_ADV_MODE_UART = 1,
 } fpga_adv_mode_t;
 

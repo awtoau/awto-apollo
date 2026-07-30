@@ -14,6 +14,9 @@
 #include <hal/include/hal_gpio.h>
 
 #include <bsp/board_api.h>
+// For tud_task(), pumped from the command wait so a slow or absent FPGA cannot
+// stall USB service for the duration.
+#include <tusb.h>
 #include <hpl/pm/hpl_pm_base.h>
 #include <hpl/gclk/hpl_gclk_base.h>
 #include <peripheral_clk_config.h>
@@ -98,6 +101,42 @@ static volatile uint8_t  tx_bits_left = 0;
 #define TX_TC_IRQn    TC1_IRQn
 // TC1 and TC2 share one GCLK channel on this part, hence the combined ID.
 #define TX_TC_GCLK_ID GCLK_CLKCTRL_ID_TC1_TC2
+
+//
+// Open-drain transmit on FPGA_ADV (PA09).
+//
+// FPGA_ADV is one wire with a CMOS driver at each end. Driving it push-pull at
+// both ends means any timing slip that enables both drivers at once puts a
+// driven high against a driven low -- a low-impedance path through two output
+// stages, tens to hundreds of milliamps, and a hardware-damage risk rather than
+// a link-reliability one. Simulation of the retry-overlap case measured up to
+// 30 us of exactly that per collision with both ends push-pull, and zero with
+// both ends open-drain (scripts/sideband_contention_probe.py in the workspace).
+//
+// The SAMD11 has no hardware open-drain mode, so it is emulated: OUT for PA09 is
+// parked LOW once, and each bit only toggles DIR. Low means drive low, high
+// means release and let the pull-ups raise the line. Two open-drain drivers
+// pulling low together is just a low.
+//
+// DIRSET/DIRCLR on PORT_IOBUS rather than gpio_set_pin_direction(), for two
+// reasons. First cost: the HAL call is three register writes including two
+// WRCONFIG, and this runs once per bit -- at 230400 baud a bit is 43.4 us of
+// wall time but only ~4.3 us of ISR budget before jitter starts eating the
+// receiver's sampling margin. IOBUS is single-cycle and DIRSET/DIRCLR are one
+// write each. Second correctness: the HAL's GPIO_DIRECTION_IN path writes
+// WRCONFIG without PULLEN, so it *clears the pull-up* -- a release through it
+// would float the line rather than let it rise, which for an open-drain
+// transmitter is the difference between a stop bit and a break.
+#define FPGA_ADV_PIN_MASK (1UL << 9)
+#define FPGA_ADV_PORT     0
+
+// Release the line: input, pull-up holds it high.
+#define FPGA_ADV_RELEASE() \
+	(PORT_IOBUS->Group[FPGA_ADV_PORT].DIRCLR.reg = FPGA_ADV_PIN_MASK)
+
+// Pull the line low: output, and OUT is already parked at 0.
+#define FPGA_ADV_PULL_LOW() \
+	(PORT_IOBUS->Group[FPGA_ADV_PORT].DIRSET.reg = FPGA_ADV_PIN_MASK)
 
 // Response buffer. Sized for the largest reply in the protocol: CMD_POWER
 // returns status + 16 payload + CRC8.
@@ -268,6 +307,34 @@ bool fpga_adv_set_mode(fpga_adv_mode_t mode)
 		return false;
 	}
 
+	// Stop the transmit timer before anything else.
+	//
+	// TC1_Handler re-muxes PA09 back to SERCOM1 when a frame finishes. Switching
+	// modes with a byte still in flight let that ISR fire *after* the EIC
+	// configuration below had been applied, quietly undoing it -- a 43 us window
+	// at 230400 baud, reachable by switching modes mid-command. Disabling the
+	// counter and its interrupt, then clearing the in-flight state, closes it:
+	// there is no pending overflow left to service.
+	//
+	// The byte being transmitted is abandoned rather than completed. That is the
+	// right trade: the mode is changing, so nothing is waiting for the reply, and
+	// a truncated frame is rejected by the responder's stop-bit check.
+	NVIC_DisableIRQ(TX_TC_IRQn);
+	TX_TC->COUNT16.CTRLA.reg &= ~TC_CTRLA_ENABLE;
+	TX_TC->COUNT16.INTFLAG.reg = TC_INTFLAG_OVF;
+	tx_bits_left = 0;
+	tx_frame     = 0;
+
+	// Leave the line released, not driven. An abandoned frame must not leave
+	// PA09 pulling low: the FPGA would read a permanent break, and with the pin
+	// about to be re-muxed nothing would ever release it.
+	FPGA_ADV_RELEASE();
+
+	// Any diagnostic square wave also stops here, for the same reason -- it
+	// drives the same pin from the task loop and would fight whichever
+	// peripheral this mode selects.
+	toggle_enabled = false;
+
 	// Discard whatever the outgoing mode observed. Without this a switch could
 	// report a port request derived from the other mechanism -- e.g. edges
 	// counted from UART traffic, which is not an advertisement at all.
@@ -313,9 +380,22 @@ static void fpga_adv_tx_byte(uint8_t byte)
 	// keeps being serviced.
 	while (tx_bits_left != 0);
 
+	// Take the pin off the SERCOM, but arrive at open-drain rather than at a
+	// driven output.
+	//
+	// Order matters. The pull-up and the parked-low OUT are established while
+	// the pin is still an input, so the line is never driven high even for a
+	// cycle -- if it were, that instant would be push-pull against an FPGA that
+	// may still be finishing a reply, which is the collision this scheme exists
+	// to make impossible. Only after that does the first bit assert DIR.
 	gpio_set_pin_function(FPGA_ADV, GPIO_PIN_FUNCTION_OFF);
-	gpio_set_pin_direction(FPGA_ADV, GPIO_DIRECTION_OUT);
-	gpio_set_pin_level(FPGA_ADV, true);
+	gpio_set_pin_direction(FPGA_ADV, GPIO_DIRECTION_IN);
+	gpio_set_pin_pull_mode(FPGA_ADV, GPIO_PULL_UP);
+
+	// Park OUT low, once. Every bit from here is a DIR toggle only, and OUT is
+	// never written again, so a low bit cannot be a driven high by accident.
+	PORT->Group[FPGA_ADV_PORT].OUTCLR.reg = FPGA_ADV_PIN_MASK;
+	FPGA_ADV_RELEASE();
 
 	// Start bit (0), eight data bits LSB first, stop bit (1).
 	tx_frame     = ((uint16_t)byte << 1) | 0x200;
@@ -357,6 +437,45 @@ uint8_t fpga_adv_command(uint8_t command, uint8_t *buffer, uint8_t length)
 		return 0;
 	}
 
+	// Refuse while the diagnostic square wave is running.
+	//
+	// The toggle owns PA09 from the task loop and knows nothing about the
+	// transmit path. With both live, fpga_adv_task() re-muxes and re-levels the
+	// pin every 50 ms underneath a frame TC1_Handler is shifting out, and the
+	// pin's direction depends on which ran last. Returning 0 makes that
+	// combination a refusal rather than a corrupted frame -- the host asked for
+	// two mutually exclusive things and gets told, instead of getting garbage
+	// that looks like a link fault.
+	if (toggle_enabled) {
+		return 0;
+	}
+
+	// Drain the receiver before arming, so a retry cannot inherit the tail of
+	// the previous reply.
+	//
+	// This is the failure the CRC was papering over. If a command times out
+	// while the FPGA is still transmitting, the bytes still on their way land in
+	// the SERCOM after this call returned. The next command re-arms the collector
+	// and the ISR fills the buffer with those stale bytes -- lengths are fixed
+	// and there is no framing, so response_len reaches response_want, the length
+	// test passes, and a full-length reply assembled from the *previous*
+	// transaction is handed back as valid. The CRC usually catches it, but it is
+	// only counted; the bytes still go to the caller and up to the host, which
+	// has no way to know.
+	//
+	// Reading DATA clears RXC, and the SERCOM has a two-deep receive buffer, so a
+	// bounded three reads empties it. Bounded rather than a while loop: this runs
+	// on the USB control path and a stuck RXC must not be able to hang it.
+	for (uint8_t drain = 0; drain < 3; drain++) {
+		if ((SERCOM1->USART.INTFLAG.reg & SERCOM_USART_INTFLAG_RXC) == 0) break;
+		(void)SERCOM1->USART.DATA.reg;
+	}
+	// Clear any error left by the noise a half-finished handover can produce, so
+	// the first real byte is not dropped as corrupt.
+	SERCOM1->USART.STATUS.reg = SERCOM_USART_STATUS_FERR |
+	                            SERCOM_USART_STATUS_BUFOVF |
+	                            SERCOM_USART_STATUS_PERR;
+
 	// Transmit first, then arm the collector.
 	//
 	// The SERCOM receiver stays enabled while we bit-bang the pin, so it sees
@@ -390,7 +509,20 @@ uint8_t fpga_adv_command(uint8_t command, uint8_t *buffer, uint8_t length)
 	const uint32_t deadline = board_millis()
 	                        + 1 + (uint32_t)(length + 2) * ADV_MS_PER_BYTE;
 
+	// Pump the USB stack while waiting.
+	//
+	// Without this the spin blocks tud_task() for the whole wait: about 1 ms for
+	// a POWER command and up to ~21 ms on a timeout. This runs inside a control
+	// transfer's SETUP stage, so a 21 ms stall risks the host's own control
+	// timeout, and it starves the console and LED tasks as well. The stall
+	// appears exactly when the FPGA is absent or slow -- which is when a host is
+	// most likely to be polling hard.
+	//
+	// tud_task() is re-entrant with respect to this path: the response arrives
+	// via SERCOM1_Handler, which touches only response[]/response_len, and no
+	// USB callback calls back into fpga_adv_command().
 	while (response_len < response_want) {
+		tud_task();
 		if ((int32_t)(board_millis() - deadline) >= 0) {
 			response_want = 0;
 			if (stat_timeout < 255) stat_timeout++;
@@ -491,9 +623,15 @@ void fpga_adv_set_toggle(bool enable)
 #ifdef BOARD_HAS_USB_SWITCH
 	toggle_enabled = enable;
 	if (enable) {
-		// Take the pin off the SERCOM and drive it directly.
+		// Take the pin off the SERCOM and drive it directly -- open-drain, for
+		// the same reason as the transmit path: a diagnostic must not be able to
+		// short the FPGA's driver. Pull-up and a parked-low OUT, then DIR
+		// toggles in fpga_adv_task().
 		gpio_set_pin_function(FPGA_ADV, GPIO_PIN_FUNCTION_OFF);
-		gpio_set_pin_direction(FPGA_ADV, GPIO_DIRECTION_OUT);
+		gpio_set_pin_direction(FPGA_ADV, GPIO_DIRECTION_IN);
+		gpio_set_pin_pull_mode(FPGA_ADV, GPIO_PULL_UP);
+		PORT->Group[FPGA_ADV_PORT].OUTCLR.reg = FPGA_ADV_PIN_MASK;
+		FPGA_ADV_RELEASE();
 	} else {
 		gpio_set_pin_direction(FPGA_ADV, GPIO_DIRECTION_IN);
 		gpio_set_pin_pull_mode(FPGA_ADV, GPIO_PULL_UP);
@@ -528,7 +666,14 @@ void fpga_adv_task(void)
 		if (board_millis() - toggle_last >= 50) {
 			toggle_last  = board_millis();
 			toggle_level = !toggle_level;
-			gpio_set_pin_level(FPGA_ADV, toggle_level);
+			// Open-drain, matching the transmit path: release for high, pull for
+			// low. The rising edge is the pull-ups rather than a driver, which is
+			// still plainly visible on a scope at 10 Hz.
+			if (toggle_level) {
+				FPGA_ADV_RELEASE();
+			} else {
+				FPGA_ADV_PULL_LOW();
+			}
 		}
 		return;
 	}
@@ -675,13 +820,25 @@ void TC1_Handler(void) {
     // the FPGA's reply is not missed.
     TX_TC->COUNT16.CTRLA.reg &= ~TC_CTRLA_ENABLE;
 
+    // Release first, then re-mux. The line is already released -- the stop bit
+    // above is a release -- so this is belt and braces against arriving here
+    // with DIR still set, and it guarantees the pin is not an output for any
+    // part of the handover.
+    FPGA_ADV_RELEASE();
     gpio_set_pin_direction(FPGA_ADV, GPIO_DIRECTION_IN);
     gpio_set_pin_pull_mode(FPGA_ADV, GPIO_PULL_UP);
     gpio_set_pin_function(FPGA_ADV, MUX_PA09C_SERCOM1_PAD3);
     return;
   }
 
-  gpio_set_pin_level(FPGA_ADV, tx_frame & 1);
+  // Open-drain: pull low for a 0, release for a 1. A DIR toggle only -- OUT was
+  // parked low in fpga_adv_tx_byte() and is never written here, so this can
+  // never source current into an FPGA that is pulling the same wire low.
+  if (tx_frame & 1) {
+    FPGA_ADV_RELEASE();
+  } else {
+    FPGA_ADV_PULL_LOW();
+  }
   tx_frame >>= 1;
   tx_bits_left--;
 }
