@@ -299,23 +299,36 @@ bool handle_jtag_request_set_out_buffer(uint8_t rhport, tusb_control_request_t c
 	//
 	// It blocks only when the host runs more than one chunk ahead, which the
 	// alternation makes impossible for a host that scans between every stage.
-	if (queued_scan.pending) {
-		// The queued scan clocks out of queued_scan.from_alt. Filling the other
-		// buffer is safe and needs no wait; filling the same one would overwrite
-		// data mid-transfer.
-		bool filling_alt = fill_is_alt;
-		if (filling_alt == queued_scan.from_alt) {
-			jtag_scan_drain();
-		}
+	// A chunk too large for the alternate buffer goes in the primary one instead,
+	// rather than being refused.
+	//
+	// The alternation must NOT be a contract the host has to track. It cannot
+	// reliably: several requests drain a queued scan, any of them shifts the parity,
+	// and a host that guessed wrong would get a stall for a chunk size the firmware
+	// is perfectly able to hold. Worse, the parity used to survive across sessions,
+	// so a fresh connection's first 1024-byte chunk failed or succeeded depending on
+	// what the previous process had done -- observed as exactly that, a pipe error on
+	// the first request of a new process.
+	//
+	// Sizing the decision on the request instead makes it self-correcting: the host
+	// sends whatever chunk it likes and the firmware puts it somewhere it fits. The
+	// cost is a drain when the large buffer is the one busy, which the host avoids by
+	// alternating sizes -- an optimisation on its side rather than a requirement.
+	if (request->wLength > JTAG_ALT_BUFFER_SIZE && fill_is_alt) {
+		fill_is_alt = false;
 	}
 
-	// If we've been handed too much data, stall.
-	//
-	// Against the capacity of the buffer being filled, not the larger of the two:
-	// the alternate buffer is 512 bytes, and a 1024-byte SET_OUT_BUFFER into it
-	// would write 512 bytes past its end.
-	if (request->wLength > jtag_fill_capacity()) {
+	// If we've been handed too much data for either buffer, stall.
+	if (request->wLength > JTAG_BUFFER_SIZE) {
 		return false;
+	}
+
+	// Wait only if the buffer about to be filled is the one being clocked. In the
+	// steady state it is not -- the queued scan is on the other buffer -- so this
+	// returns immediately and the fill overlaps the clocking, which is the overlap
+	// this whole change exists to create.
+	if (queued_scan.pending && fill_is_alt == queued_scan.from_alt) {
+		jtag_scan_drain();
 	}
 
 	uint8_t *fill = jtag_fill_buffer();
@@ -441,9 +454,14 @@ bool handle_jtag_request_scan(uint8_t rhport, tusb_control_request_t const* requ
 	// Validate now rather than in the task. The task runs from the main loop with no
 	// control transfer to fail, so a bad request discovered there could only be
 	// dropped silently; here it can still stall and tell the host.
+	//
+	// Against the buffer the data was actually staged into, which is the one
+	// SET_OUT_BUFFER chose by size. Deriving the capacity from fill_is_alt is the
+	// same thing, since that request may have flipped it, but the ordering matters:
+	// this must run AFTER the stage, which it always does -- the host cannot scan a
+	// chunk it has not sent.
 	size_t bytes = request->wValue / 8;
-	size_t capacity = fill_is_alt ? JTAG_ALT_BUFFER_SIZE : JTAG_BUFFER_SIZE;
-	if (bytes > capacity || request->wValue == 0) {
+	if (bytes > jtag_fill_capacity() || request->wValue == 0) {
 		return false;
 	}
 
@@ -561,6 +579,24 @@ bool handle_jtag_get_state(uint8_t rhport, tusb_control_request_t const* request
 bool handle_jtag_start(uint8_t rhport, tusb_control_request_t const* request)
 {
 	led_set_pattern(LED_JTAG_CONNECTED);
+
+	// Reset the buffer alternation for the new session.
+	//
+	// Without this the parity survives across host sessions, because these are
+	// statics and nothing else clears them. The host then has no way to know which
+	// buffer it is filling: a fresh connection whose first chunk is 1024 bytes gets
+	// a stall if the previous session happened to leave the 512-byte buffer in the
+	// fill position. That is exactly the failure seen in testing -- the first
+	// SET_OUT_BUFFER of a new process failing with a pipe error, depending on what
+	// the last one did.
+	//
+	// JTAG_START is the right place: the host issues exactly one per session, and
+	// the alternation is meaningless outside a session.
+	queued_scan.pending = false;
+	fill_is_alt         = false;
+	staged_valid        = false;
+	staged_bytes        = 0;
+
 	jtag_init();
 
 	return tud_control_xfer(rhport, request, NULL, 0);
