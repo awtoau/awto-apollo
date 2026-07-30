@@ -45,6 +45,16 @@
 
 
 
+// Housekeeping tick. 5 ms is chosen against human timescales, not USB ones: the
+// shortest thing serviced on it is LED perception at ~16 ms, so 5 ms is 3x
+// faster than anything that could look laggy. On expiry led_task() and
+// button_task() run once; nothing is lost by a missed tick, since both read
+// current state rather than accumulate.
+#define HOUSEKEEPING_PERIOD_MS 5u
+
+static uint32_t next_housekeeping_ms = 0;
+
+
 /**
  * Main round-robin 'scheduler' for the execution tasks.
  */
@@ -112,8 +122,40 @@ int main(void)
 		// configure time.
 		jtag_scan_task();
 		console_task();
-		led_task();
-		button_task();
+
+		// Housekeeping runs on a millisecond tick, not every pass.
+		//
+		// This loop turns at roughly 200 kHz -- DMA freed it, so it spins a few
+		// hundred times per clocked chunk. Nothing below is a USB deadline: a
+		// button press lasts 50-200 ms, an LED is imperceptible below ~16 ms, and
+		// the advertisement window is 200 ms. Sampling any of them per pass means
+		// ~10,000 samples per button press, which is not a speed problem so much
+		// as the wrong construction -- and button_pressed() is the expensive one,
+		// since PA16 is shared with LED_A and each poll re-muxes the pin and waits
+		// 50 cycles for the pull-up to settle.
+		//
+		// HOUSEKEEPING_PERIOD_MS is 5: still 3x faster than the shortest human
+		// timescale here and 10x under the perception threshold, so nothing looks
+		// laggy, while cutting both from ~200 kHz to 200 Hz.
+		//
+		// Stated plainly: this is NOT a throughput win. Removing the button poll
+		// entirely measured 326.4 against 327.9 ms, inside the run spread,
+		// and masking the EIC during JTAG likewise. It is done because polling
+		// human-scale inputs at 200 kHz is wrong, not because the benchmark
+		// notices. board_millis() is already running for JTAG and the sideband, so
+		// this adds no timer.
+		// Signed difference so the comparison is wrap-safe: board_millis() is a
+		// 32-bit millisecond counter and rolls over after ~49 days.
+		if ((int32_t)(board_millis() - next_housekeeping_ms) >= 0) {
+			next_housekeeping_ms = board_millis() + HOUSEKEEPING_PERIOD_MS;
+			led_task();
+			button_task();
+		}
+
+		// Left every pass deliberately. It has its own 200 ms window internally
+		// and, unlike the two above, is on the path that decides USB port
+		// ownership -- so it keeps servicing at full rate rather than inheriting a
+		// tick that would interact with its own timing.
 		fpga_adv_task();
 	}
 
