@@ -9,6 +9,8 @@
 
 #include <tusb.h>
 
+#include <stdbool.h>
+
 #include "led.h"
 #include "uart.h"
 #include "apollo_mode.h"
@@ -17,13 +19,59 @@
 extern bool uart_active;
 
 
+// UART RX interrupt can fire while TinyUSB is in critical sections.
+// Buffer bytes here and flush them from console_task() in thread context.
+#define UART_RX_RING_SIZE 256
+
+static volatile uint8_t uart_rx_ring[UART_RX_RING_SIZE];
+static volatile uint16_t uart_rx_head = 0;
+static volatile uint16_t uart_rx_tail = 0;
+
+
+static inline uint16_t uart_ring_next(uint16_t v)
+{
+	return (uint16_t)((v + 1u) & (UART_RX_RING_SIZE - 1u));
+}
+
+
+static inline bool uart_ring_is_empty(void)
+{
+	return uart_rx_head == uart_rx_tail;
+}
+
+
+static inline void uart_ring_push(uint8_t byte)
+{
+	uint16_t next = uart_ring_next(uart_rx_head);
+
+	// Drop oldest byte on overflow to preserve newest console data.
+	if (next == uart_rx_tail) {
+		uart_rx_tail = uart_ring_next(uart_rx_tail);
+	}
+
+	uart_rx_ring[uart_rx_head] = byte;
+	uart_rx_head = next;
+}
+
+
+static inline bool uart_ring_pop(uint8_t *byte)
+{
+	if (uart_ring_is_empty()) {
+		return false;
+	}
+
+	*byte = uart_rx_ring[uart_rx_tail];
+	uart_rx_tail = uart_ring_next(uart_rx_tail);
+	return true;
+}
+
+
 /**
  * Pass any data received via UART directly up to the host.
  */
 void uart_byte_received_cb(uint8_t byte)
 {
-	tud_cdc_write_char(byte);
-	tud_cdc_write_flush();
+	uart_ring_push(byte);
 }
 
 
@@ -34,6 +82,38 @@ void console_task(void)
 {
 	if (!tud_cdc_connected()) {
 		return;
+	}
+
+	// The console must be entirely inert while JTAG programming is in progress.
+	//
+	// UART and JTAG share pins on this part -- TDI is PA14, TMS is PA11 -- so
+	// they cannot both own them. uart_initialize() already refuses while the
+	// JTAG lock is held, which is what stops the console stealing the pins
+	// mid-programming. But refusing is not the same as not asking: the main loop
+	// is an unthrottled while(1), so without this check console_task() calls
+	// uart_initialize() on every iteration for the whole duration of a
+	// programming operation, purely to be turned away. JTAG programming is the
+	// one operation here that must not be disturbed, and a half-programmed FPGA
+	// is the failure being prevented.
+	//
+	// Bailing out entirely also leaves the ring buffer alone, so nothing is
+	// drained to CDC while the FPGA cannot be sending anything anyway.
+	if (apollo_mode_jtag_active()) {
+		return;
+	}
+
+	// Opportunistically initialize UART if callbacks were missed.
+	if (!uart_active) {
+		uart_initialize(true, 115200);
+	}
+
+	// Flush UART->CDC data in task context (TinyUSB-safe context).
+	if (tud_cdc_write_available()) {
+		uint8_t byte;
+		while (tud_cdc_write_available() && uart_ring_pop(&byte)) {
+			tud_cdc_write_char(byte);
+		}
+		tud_cdc_write_flush();
 	}
 
 	// We can send data to the FPGA over UART iff:
