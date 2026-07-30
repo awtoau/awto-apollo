@@ -15,6 +15,7 @@
 
 #include <tusb.h>
 #include <apollo_board.h>
+#include <bsp/board_api.h>
 
 #include "led.h"
 #include "jtag.h"
@@ -221,4 +222,137 @@ bool handle_jtag_stop(uint8_t rhport, tusb_control_request_t const* request)
 	jtag_deinit();
 
 	return tud_control_xfer(rhport, request, NULL, 0);
+}
+
+
+/**
+ * Synthetic JTAG throughput benchmark.
+ *
+ * Every previous measurement of the JTAG path was taken from the host, and so
+ * included a SET_OUT_BUFFER control transfer per 256-byte chunk -- which is the
+ * larger cost by a wide margin. This request removes USB from the measurement
+ * entirely: one small setup transfer starts it, the MCU then clocks
+ * (chunk x repeats) bytes out of a buffer it already holds, and one IN transfer
+ * collects the result. What happens in between is MCU and wire only.
+ *
+ * The data source is a rolling pattern rather than zeroes, and every received
+ * byte is checked against what the TAP should have returned. A stalled or no-op
+ * loop is indistinguishable from a fast one on a stopwatch, so this readback
+ * check is the evidence that bytes actually moved; and a rolling pattern makes
+ * it sensitive to bytes arriving in the wrong order, which a constant is not.
+ *
+ * The caller must have parked the TAP in SHIFT_DR. Anywhere else, TDO is not
+ * carrying data: SCK still runs at full rate and the timings still look
+ * entirely reasonable, but the readback is all zeroes and proves nothing.
+ *
+ * Left in the firmware permanently: it is the only instrument that can measure
+ * the JTAG side in isolation, and so it is also the regression check for it.
+ *
+ * Arguments:
+ *     wValue: number of repeats (how many times the chunk is clocked out)
+ *     wIndex: low byte  -- chunk size in bytes (0 means 256)
+ *             high byte -- SERCOM baud divider to use for the run; 0xFF keeps
+ *                          the JTAG default. SCK = 48MHz / (2 * (divider + 1)).
+ *
+ * Returns 12 bytes, little-endian:
+ *     [0:4]  elapsed milliseconds
+ *     [4:6]  total bytes clocked / 256
+ *     [6:10] count of bytes that did not read back as expected
+ *     [10]   first byte sent on the last iteration
+ *     [11]   first byte received on the last iteration
+ */
+bool handle_jtag_benchmark(uint8_t rhport, tusb_control_request_t const* request)
+{
+	static uint8_t result[12];
+
+	uint16_t repeats = request->wValue;
+	uint16_t chunk   = request->wIndex & 0xFF;
+	uint8_t  divider = (request->wIndex >> 8) & 0xFF;
+
+	// A chunk of 0 means a full buffer; 256 does not fit in the low byte.
+	if (chunk == 0) {
+		chunk = sizeof(jtag_out_buffer);
+	}
+	if (repeats == 0) {
+		return false;
+	}
+
+	// Fill the source buffer with a rolling pattern. Done here rather than by
+	// the host so that no bulk data crosses USB for this measurement at all.
+	for (unsigned i = 0; i < chunk; ++i) {
+		jtag_out_buffer[i] = (uint8_t)(i * 7 + 1);
+	}
+
+	// Re-clock the SERCOM if the caller asked for a different rate. This is the
+	// point of the harness: SCK can be pushed until TDO readback stops matching,
+	// with no USB traffic in the way to confound the result.
+	if (divider != 0xFF) {
+		spi_init(SPI_FPGA_JTAG, true, false, divider, 1, 1);
+	}
+
+	spi_configure_pinmux(SPI_FPGA_JTAG);
+
+	// Count bytes that came back exactly as the TAP should have returned them,
+	// rather than accumulating a hash. In SHIFT_DR with BYPASS selected, TDO is
+	// TDI delayed by one bit, so the expected response is fully predictable and
+	// can be compared byte for byte. A hash was tried first and proved a poor
+	// instrument: it is length-dependent, it wraps, and a wrong-but-consistent
+	// link still yields a stable value. A mismatch count answers the question
+	// that actually matters -- did every byte arrive intact -- and does so
+	// identically at any transfer size or clock rate.
+	uint32_t mismatches = 0;
+	uint8_t carry = 0;
+
+	uint32_t start = board_millis();
+
+	for (unsigned r = 0; r < repeats; ++r) {
+		spi_send(SPI_FPGA_JTAG, jtag_out_buffer, jtag_in_buffer, chunk);
+
+		// Reading every byte also guarantees the compiler cannot discard the
+		// transfer as unused work.
+		for (unsigned i = 0; i < chunk; ++i) {
+			// SPI here is LSB-first, so the one-bit BYPASS delay shifts each
+			// byte right, with the previous byte's LSB arriving in bit 7.
+			uint8_t sent     = jtag_out_buffer[i];
+			uint8_t expected = (uint8_t)((sent << 1) | carry);
+			carry = (uint8_t)(sent >> 7);
+
+			if (jtag_in_buffer[i] != expected) {
+				mismatches++;
+			}
+		}
+	}
+
+	uint32_t elapsed = board_millis() - start;
+
+	spi_release_pinmux(SPI_FPGA_JTAG);
+
+	// Restore the standard JTAG clocking, so a benchmark run at an exotic rate
+	// cannot leave the scan chain misconfigured for the configuration that
+	// follows it.
+	if (divider != 0xFF) {
+		spi_init(SPI_FPGA_JTAG, true, false, 1, 1, 1);
+	}
+
+	uint32_t blocks = ((uint32_t)chunk * repeats) / 256;
+
+	result[0] = elapsed            & 0xFF;
+	result[1] = (elapsed >>  8)    & 0xFF;
+	result[2] = (elapsed >> 16)    & 0xFF;
+	result[3] = (elapsed >> 24)    & 0xFF;
+	result[4] = blocks             & 0xFF;
+	result[5] = (blocks >>   8)    & 0xFF;
+	result[6] = mismatches         & 0xFF;
+	result[7] = (mismatches >>  8) & 0xFF;
+	result[8] = (mismatches >> 16) & 0xFF;
+	result[9] = (mismatches >> 24) & 0xFF;
+
+	// The first sent/received pair from the last iteration. When a run fails,
+	// the difference between "TDO stuck at 0x00", "stuck at 0xFF" and "shifted
+	// by the wrong number of bits" are three quite different faults, and the
+	// mismatch count alone cannot distinguish them.
+	result[10] = jtag_out_buffer[0];
+	result[11] = jtag_in_buffer[0];
+
+	return tud_control_xfer(rhport, request, result, sizeof(result));
 }

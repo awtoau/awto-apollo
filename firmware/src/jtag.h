@@ -135,4 +135,16 @@ bool handle_jtag_stop(uint8_t rhport, tusb_control_request_t const* request);
  */
 bool handle_jtag_get_state(uint8_t rhport, tusb_control_request_t const* request);
 
+
+/**
+ * Synthetic JTAG throughput benchmark: clocks generated data out over JTAG with
+ * no bulk USB traffic, and reports elapsed time plus a TDO checksum.
+ *
+ * Arguments:
+ *     wValue: number of repeats
+ *     wIndex: low byte -- chunk size (0 means 256); high byte -- SERCOM baud
+ *             divider, or 0xFF to keep the JTAG default.
+ */
+bool handle_jtag_benchmark(uint8_t rhport, tusb_control_request_t const* request);
+
 #endif
