@@ -22,10 +22,7 @@
 #include "fpga.h"
 #include "fpga_adv.h"
 #include "usb_switch.h"
-
-
-/** Store the current LED blink pattern. */
-static led_pattern_t led_pattern = LED_IDLE;
+#include "apollo_mode.h"
 
 
 /**
@@ -112,108 +109,36 @@ void leds_on(void)
 
 
 /**
- * Turns on the given LED.
- */
-static void display_led_number(uint8_t number)
-{
-  if (number < LED_COUNT) {
-    led_on(led_pins[number]);
-  }
-}
-
-
-/**
- * Sets the active LED pattern.
- */
-void led_set_pattern(led_pattern_t pattern)
-{
-    led_pattern = pattern;
-    leds_off();
-    // Values of 0 to 31 should be set immediately as static patterns.
-    if (led_pattern < 32) {
-      for (int i = 0; i < 5; i++) {
-        if (led_pattern & (1 << i)) {
-          display_led_number(i);
-        }
-      }
-    }
-}
-
-
-/**
- * Task that handles LED updates.
+ * Drives one LED per subsystem, straight from live state.
+ *
+ * There are no patterns, no animation and no host control. Every LED is a direct
+ * readout of a condition the firmware can already answer, so none of them needs
+ * decoding and none of them carries state of its own.
+ *
+ * What this replaced: a pattern state machine, a host request (0xa1) to select
+ * patterns, board_millis() scheduling, sweep and blink animations, and a
+ * bit-position display helper -- all to encode operations as coded patterns across
+ * five LEDs. An indicator whose meaning has to be looked up conveys nothing at a
+ * glance. This part had under 500 bytes spare and that budget went to DMA-driven
+ * JTAG clocking instead, worth 1.26x (see the JTAG doc).
+ *
+ * The mapping, which needs no legend:
+ *
+ *   LED_A (blue)   power -- on whenever Apollo is running
+ *   LED_B (pink)   JTAG  -- the uC is driving the JTAG lines, keep the header off
+ *   LED_C (white)  FPGA has requested the CONTROL port
+ *   LED_D (pink)   FPGA is online and holding the USB port
+ *   LED_E (blue)   reserved for fault indication
+ *
+ * Being stateless is the point: recomputing five levels per iteration costs a few
+ * GPIO stores, and it is what let the scheduling, the animation state, the pattern
+ * variable and the USB request all go.
  */
 void led_task(void)
 {
-  static uint32_t start_ms = 0;
-  static uint8_t active_led = 0;
-  static bool count_up = true;
-
-  // Values of 0 to 31 define static patterns only.
-  if (led_pattern < 32) {
-    return;
-  }
-
-  // When the device is idle, use the following scheme for LEDs:
-  // - LED A: power indication (always on in Apollo)
-  // - LED B: FPGA allowed online
-  // - LED C: FPGA has requested CONTROL port
-  // - LED D: USB switched to FPGA
-  // - LED E: reserved for flashing patterns (e.g. fault indication)
-  if (led_pattern == LED_IDLE) {
-    led_set(LED_A, true);
-    led_set(LED_B, fpga_is_online());
-    led_set(LED_C, fpga_requesting_port());
-    led_set(LED_D, fpga_controls_usb_port());
-    led_set(LED_E, false);
-    return;
-  }
-
-  // Blink every interval ms
-  if ( board_millis() - start_ms < led_pattern) return; // not enough time
-  start_ms += led_pattern;
-
-  switch (led_pattern) {
-
-    // Blink patterns for when the device is being used for JTAG
-    // operation. When these are on, the uC is driving the JTAG lines,
-    // so the JTAG header probably shouldn't used to drive the lines.
-    case LED_JTAG_CONNECTED:
-    case LED_JTAG_UPLOADING:
-
-      // Sweep back and forth.
-      if (active_led == 0xFF) {
-        count_up = true;
-      }
-      if (active_led == 4) {
-        count_up = false;
-      }
-      active_led = count_up ? active_led + 1  : active_led - 1;
-
-      leds_off();
-      display_led_number(active_led);
-      display_led_number(active_led + 1);
-
-      break;
-
-    // Blink patterns for when the device is being used for SPI flash access.
-    // When these are displayed,
-    case LED_FLASH_CONNECTED:
-
-      if (active_led == 5) {
-        active_led = 0;
-      }
-
-      leds_off();
-      display_led_number(active_led++);
-
-      break;
-
-
-    // For any other blink pattern, keep the LEDs all on.
-    default:
-      leds_on();
-      break;
-
-  }
+  led_set(LED_A, true);
+  led_set(LED_B, apollo_mode_jtag_active());
+  led_set(LED_C, fpga_requesting_port());
+  led_set(LED_D, fpga_is_online() && fpga_controls_usb_port());
+  led_set(LED_E, false);
 }

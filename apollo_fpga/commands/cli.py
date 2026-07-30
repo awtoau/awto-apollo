@@ -428,9 +428,6 @@ def jtag_debug_spi(device, args):
         _do_debug_spi(device, spi, args, invert_cs=False)
 
 
-def set_led_pattern(device, args):
-    device.set_led_pattern(int(args.pattern))
-
 def debug_spi_inv(device, args):
     debug_spi(device, args, invert_cs=True)
 
@@ -514,8 +511,6 @@ COMMANDS = [
             help="Reads or writes to a provided register of JTAG-tunneled debug SPI."),
 
     # Misc
-    Command("leds", args=["pattern"], handler=set_led_pattern,
-            help="Sets the specified pattern for the Debug LEDs."),
     Command("exit-dfu", handler=None,
             help="Leaves the DFU bootloader and runs the application."),
 ]

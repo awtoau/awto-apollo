@@ -413,72 +413,65 @@ class ECP5CommandBasedProgrammer(ECP5Programmer):
 
         bitstream = self._generate_bit_reversed_bitstream(bitstream, byte_reverse=True)
 
-        self.chain.debugger.set_led_pattern(self.chain.debugger.LED_PATTERN_UPLOAD)
+        # Ensure we're at the start of the configuration process. This also clears out any
+        # existing bitstream.
+        self._restart_configuration_process()
 
-        try:
-            # Ensure we're at the start of the configuration process. This also clears out any
-            # existing bitstream.
-            self._restart_configuration_process()
+        # Perform any pre-configuration tasks necessary.
+        self._perform_preconfiguration_tasks()
 
-            # Perform any pre-configuration tasks necessary.
-            self._perform_preconfiguration_tasks()
+        # Read the part ID from the FPGA and verify that it is in the valid range.
+        self._capture_part_id()
 
-            # Read the part ID from the FPGA and verify that it is in the valid range.
-            self._capture_part_id()
+        # We could check that the FPGA's part ID matches the bitstream's
+        # part ID at this point, but for now we try to proceed without
+        # verification. If there is a mismatch, configuration will fail.
+        #self._execute_command(self.Opcode.VERIFY_ID, b"\x21\x11\x10\x43")
 
-            # We could check that the FPGA's part ID matches the bitstream's
-            # part ID at this point, but for now we try to proceed without
-            # verification. If there is a mismatch, configuration will fail.
-            #self._execute_command(self.Opcode.VERIFY_ID, b"\x21\x11\x10\x43")
+        # ???
+        self._execute_command(0x1C, bits(b"\x3f" + b"\xff" * 63, 510), check_status=False, bits_per_size_unit=1)
 
-            # ???
-            self._execute_command(0x1C, bits(b"\x3f" + b"\xff" * 63, 510), check_status=False, bits_per_size_unit=1)
+        # Enable configuration.
+        self._execute_command(self.Opcode.ISC_ENABLE, b"\x00", check_status=False)
+        self.chain.run_test(2)
 
-            # Enable configuration.
-            self._execute_command(self.Opcode.ISC_ENABLE, b"\x00", check_status=False)
-            self.chain.run_test(2)
+        status = self._read_status()
+        self._validate_status(status, expect_isc=True)
 
-            status = self._read_status()
-            self._validate_status(status, expect_isc=True)
+        # Erase the device's SRAM.
+        self._execute_command(self.Opcode.ISC_ERASE, b"\x01", wait_for_completion=True, check_status=True)
+        self.chain.run_test(2)
 
-            # Erase the device's SRAM.
-            self._execute_command(self.Opcode.ISC_ERASE, b"\x01", wait_for_completion=True, check_status=True)
-            self.chain.run_test(2)
+        # Check our status.
+        status = self._read_status()
+        self._validate_status(status, continue_anyway=True)
 
-            # Check our status.
-            status = self._read_status()
-            self._validate_status(status, continue_anyway=True)
+        # Shift the bitstream to the FPGA; this is essentially just executing all of the
+        # commands in the bitstream.
+        self._execute_command(self.Opcode.LSC_SET_WORKING_ADDRESS, b"\x01")
 
-            # Shift the bitstream to the FPGA; this is essentially just executing all of the
-            # commands in the bitstream.
-            self._execute_command(self.Opcode.LSC_SET_WORKING_ADDRESS, b"\x01")
+        # Shift the bitstream to the FPGA; this is essentially just executing all of the commands in the bitstream.
+        #
+        # The burst is write-only: the ECP5 returns nothing meaningful on TDO while the
+        # bitstream is shifted in, and configure() discards the response. Reading it back
+        # costs a GET_IN_BUFFER control transfer per chunk -- measured at ~28% of total
+        # configuration time -- so suppress it.
+        self._execute_command(self.Opcode.LSC_BITSTREAM_BURST, bitstream, check_status=False,
+                wait_for_completion=False, ignore_response=True)
 
-            # Shift the bitstream to the FPGA; this is essentially just executing all of the commands in the bitstream.
-            #
-            # The burst is write-only: the ECP5 returns nothing meaningful on TDO while the
-            # bitstream is shifted in, and configure() discards the response. Reading it back
-            # costs a GET_IN_BUFFER control transfer per chunk -- measured at ~28% of total
-            # configuration time -- so suppress it.
-            self._execute_command(self.Opcode.LSC_BITSTREAM_BURST, bitstream, check_status=False,
-                    wait_for_completion=False, ignore_response=True)
+        # Idle for long enough to let the configuration take.
+        self._allow_configuration_time()
 
-            # Idle for long enough to let the configuration take.
-            self._allow_configuration_time()
+        # Check the device's status.
+        status = self._read_status()
+        self._validate_status(status, expect_done=True)
 
-            # Check the device's status.
-            status = self._read_status()
-            self._validate_status(status, expect_done=True)
+        # Disable configuration, and allow the FPGA to start.
+        self._execute_command(self.Opcode.ISC_DISABLE, check_status=False)
+        self.chain.run_test(2)
 
-            # Disable configuration, and allow the FPGA to start.
-            self._execute_command(self.Opcode.ISC_DISABLE, check_status=False)
-            self.chain.run_test(2)
-
-            status = self._read_status()
-            self._validate_status(status, expect_done=True)
-
-
-        finally:
-            self.chain.debugger.set_led_pattern(self.chain.debugger.LED_PATTERN_IDLE)
+        status = self._read_status()
+        self._validate_status(status, expect_done=True)
 
 
 

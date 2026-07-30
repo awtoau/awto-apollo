@@ -32,7 +32,7 @@
 // Supported vendor requests.
 enum {
 	VENDOR_REQUEST_GET_ID                  = 0xa0,
-	VENDOR_REQUEST_SET_LED_PATTERN         = 0xa1,
+	// 0xa1 was SET_LED_PATTERN, removed -- do not reuse (see led.c).
 	VENDOR_REQUEST_GET_FIRMWARE_VERSION    = 0xa2,
 	VENDOR_REQUEST_GET_USB_API_VERSION     = 0xa3,
 	VENDOR_REQUEST_GET_ADC_READING         = 0xa4,
@@ -328,15 +328,6 @@ static bool handle_jtag_get_info_request(uint8_t rhport, tusb_control_request_t 
 }
 
 
-/**
- * Request that changes the active LED pattern.
- */
-static bool handle_set_led_pattern(uint8_t rhport, tusb_control_request_t const* request)
-{
-	led_set_pattern(request->wValue);
-	return tud_control_xfer(rhport, request, NULL, 0);
-}
-
 
 /**
  * Request that changes the active LED pattern.
@@ -541,7 +532,6 @@ static bool is_allowed_during_jtag_programming(uint8_t request)
 	switch (request) {
 		case VENDOR_REQUEST_EMERGENCY_RESET:
 		case VENDOR_REQUEST_BOOT_TO_DFU:
-		case VENDOR_REQUEST_SET_LED_PATTERN:
 			return true;
 		default:
 			return false;
@@ -558,7 +548,6 @@ static bool is_allowed_during_jtag_programming(uint8_t request)
 static bool handle_emergency_reset(uint8_t rhport, tusb_control_request_t const* request)
 {
 	if (apollo_mode_jtag_active()) {
-		led_set_pattern(LED_IDLE);
 		jtag_deinit();
 	}
 
@@ -636,10 +625,6 @@ static bool handle_vendor_request_setup(uint8_t rhport, tusb_control_request_t c
 
 		case VENDOR_REQUEST_EMERGENCY_RESET:
 			return handle_emergency_reset(rhport, request);
-
-		// LED control requests.
-		case VENDOR_REQUEST_SET_LED_PATTERN:
-			return handle_set_led_pattern(rhport, request);
 
 		// Debug SPI requests.
 #ifdef _BOARD_HAS_DEBUG_SPI

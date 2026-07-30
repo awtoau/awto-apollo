@@ -13,33 +13,6 @@
 #include <apollo_board.h>
 
 /**
- * LED patterns.
- *
- * Values 0 to 31 will be interpreted as static bitmasks, and can be used
- * to turn on specific combinations of LEDs in a fixed pattern.
- *
- * Other values as defined in this enum will produce dynamic blink patterns,
- * with different semantic meanings.
- */
-typedef enum {
-  LED_IDLE = 500,
-  LED_JTAG_CONNECTED = 150,
-  LED_JTAG_UPLOADING = 50,
-
-  LED_FLASH_CONNECTED = 130,
-} led_pattern_t;
-
-
-
-/**
- * Sets the active LED pattern.
- *
- * See @ref led_pattern_t for the meaning of the pattern argument.
- */
-void led_set_pattern(led_pattern_t pattern);
-
-
-/**
  * Sets up each of the LEDs for use.
  */
 void led_init(void);
@@ -76,7 +49,10 @@ void led_set(led_t led, bool on);
 
 
 /**
- * Task that handles LED updates.
+ * Drives one LED per subsystem from live state.
+ *
+ * There are no patterns and no host control: each LED is a direct readout, so
+ * nothing needs decoding. See led.c for the mapping.
  */
 void led_task(void);
 

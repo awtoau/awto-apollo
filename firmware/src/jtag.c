@@ -706,7 +706,8 @@ bool handle_jtag_get_state(uint8_t rhport, tusb_control_request_t const* request
  */
 bool handle_jtag_start(uint8_t rhport, tusb_control_request_t const* request)
 {
-	led_set_pattern(LED_JTAG_CONNECTED);
+	// No LED call here: led_task() reads apollo_mode_jtag_active() directly, and
+	// that flag is already set for the whole JTAG session. See led.c.
 
 	// Reset the buffer alternation for the new session.
 	//
@@ -742,7 +743,8 @@ bool handle_jtag_start(uint8_t rhport, tusb_control_request_t const* request)
  */
 bool handle_jtag_stop(uint8_t rhport, tusb_control_request_t const* request)
 {
-	led_set_pattern(LED_IDLE);
+	// Nothing to reset: the JTAG LED follows apollo_mode_jtag_active(), which
+	// jtag_deinit() clears below.
 
 	// Stop driving the chain only once the last queued scan has been shifted out.
 	// jtag_deinit() releases the JTAG lock and the pins; doing that with a chunk

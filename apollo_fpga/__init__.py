@@ -63,7 +63,6 @@ class ApolloDebugger:
         LUNA_USB_IDS += [tuple([int(x, 16) for x in os.getenv("LUNA_USB_IDS").split(":")])]
 
     REQUEST_GET_ID                  = 0xa0
-    REQUEST_SET_LED_PATTERN         = 0xa1
     REQUEST_GET_FIRMWARE_VERSION    = 0xa2
     REQUEST_GET_USB_API_VERSION     = 0xa3
     REQUEST_GET_ADC_READING         = 0xa4
@@ -73,8 +72,6 @@ class ApolloDebugger:
     REQUEST_EMERGENCY_RESET         = 0xec
     REQUEST_BOOT_TO_DFU             = 0xed
 
-    LED_PATTERN_IDLE = 500
-    LED_PATTERN_UPLOAD = 50
 
 
     # External boards (non-Cynthion boards) are indicated with a Major revision of 0xFF.
@@ -377,8 +374,6 @@ class ApolloDebugger:
         return bytes(result)
 
 
-    def set_led_pattern(self, number):
-        self.out_request(self.REQUEST_SET_LED_PATTERN, number)
 
 
     def soft_reset(self):
