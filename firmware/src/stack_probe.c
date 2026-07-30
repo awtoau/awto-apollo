@@ -19,6 +19,13 @@
  * plausible and collectively wrong. Disabling LTO to obtain them is worse -- it
  * reclaims 2968 bytes on a part that is otherwise 568 bytes from its ROM ceiling.
  *
+ * This file is compiled WITHOUT LTO (see firmware/Makefile). With LTO enabled the
+ * painting and scanning functions get inlined into callers in different objects,
+ * and the two resolved `&_sstack` to different places: the probe reported
+ * high_water == the full region size while simultaneously reporting no overflow,
+ * which are contradictory. Excluding one small file costs nothing measurable and
+ * keeps both halves agreeing on where the region is.
+ *
  * Why the firmware reports it rather than a debugger reading it: there is no SWD
  * debugger in this workflow. Reporting through a vendor request means the
  * measurement works on any board already running this firmware, with no extra
@@ -40,63 +47,84 @@ extern uint32_t _sstack;
 extern uint32_t _estack;
 
 /**
- * The paint value.
+ * The region bounds, read through volatile pointers.
  *
- * Not zero and not 0xff: .bss is already zeroed and erased flash reads as 0xff,
- * so either would be indistinguishable from memory that was never painted, and
- * the measurement would silently read as "nothing used" or "everything used".
- * 0xDEADBEEF is also unlikely to be written coincidentally by real code, which
- * matters because a single matching word is what the scan below stops on.
+ * This indirection is load-bearing rather than style. With LTO the painting and
+ * scanning functions get inlined into callers in different objects, and the two
+ * resolved `&_sstack` to different addresses -- the probe reported
+ * high_water == the whole region while simultaneously reporting no overflow,
+ * which cannot both be true. Forcing the address through a volatile makes every
+ * caller read the same linker symbol at run time instead of letting the optimiser
+ * bake in its own answer per copy.
  */
-#define STACK_PAINT 0xDEADBEEFul
+static uint8_t *const volatile stack_bottom = (uint8_t *)&_sstack;
+static uint8_t *const volatile stack_top    = (uint8_t *)&_estack;
+
+/**
+ * The fill byte.
+ *
+ * A single repeated byte rather than a 32-bit word, following FreeRTOS's
+ * prvTaskCheckFreeStackSpace: it makes the scan byte-granular, so alignment
+ * cannot cause a miss, and it removes a failure mode the word version has. A word
+ * scan that stops at the first match is defeated by ONE coincidental 0xDEADBEEF
+ * anywhere in the used region -- it would report far less usage than really
+ * occurred, which is the dangerous direction to be wrong in.
+ *
+ * 0xA5 is not 0x00 and not 0xFF: .bss is already zeroed and erased flash reads as
+ * 0xFF, so either would be indistinguishable from memory that was never painted.
+ */
+#define STACK_FILL_BYTE 0xA5u
 
 
-void stack_probe_paint(void)
+__attribute__((noinline)) void stack_probe_paint(void)
 {
-	// Paint from the bottom of the region up towards the current stack
-	// pointer, and stop short of it.
+	// Paint from the bottom of the region up towards the current stack pointer,
+	// stopping short of it. The live frame belongs to this function and its
+	// callers, and overwriting that is a crash rather than a measurement.
 	//
-	// The live frame belongs to this function and its callers -- main() and
-	// whatever called it -- and overwriting that is an immediate crash rather
-	// than a measurement. `&here` is the address of a local, so it sits inside
-	// the current frame, and stopping below it keeps the paint strictly in the
-	// unused region.
+	// `&here` is a local, so it sits in the current frame. The margin below it
+	// covers this function's own remaining frame plus anything the compiler
+	// spills after this point.
 	//
-	// The consequence for accuracy is worth stating: whatever depth was already
-	// in use at this point is invisible to the measurement, so the result is a
-	// lower bound on total usage. Painting is done early in main() to keep that
-	// unmeasured portion as small as possible.
-	volatile uint32_t here;
-	uint32_t *limit = (uint32_t *)((uintptr_t)&here - sizeof(uint32_t) * 4);
+	// Consequence for accuracy, worth stating: whatever depth was in use when
+	// this ran is invisible, so the result is a LOWER BOUND. Called as early in
+	// main() as possible to keep that unmeasured portion small.
+	volatile uint8_t here;
+	uint8_t *bottom = stack_bottom;
+	uint8_t *limit  = (uint8_t *)&here - 64;
 
-	for (uint32_t *word = &_sstack; word < limit; word++) {
-		*word = STACK_PAINT;
+	while (bottom < limit) {
+		*bottom++ = (uint8_t)STACK_FILL_BYTE;
 	}
 }
 
 
-uint32_t stack_probe_high_water(void)
+__attribute__((noinline)) uint32_t stack_probe_high_water(void)
 {
-	// Scan up from the bottom for the first word still painted. Everything
-	// below it has been written, so that address is the deepest point reached.
+	// Count up from the bottom while the fill survives, exactly as FreeRTOS
+	// does. The first byte that differs is the deepest point reached.
 	//
-	// Scanning up rather than down matters: the stack grows down on this part,
-	// so the deepest excursion leaves its mark at the LOWEST address. Searching
-	// from the top would find the boundary of the currently-live frame, which is
-	// shallower and would understate usage.
-	uint32_t *word = &_sstack;
-	while (word < &_estack && *word != STACK_PAINT) {
-		word++;
+	// Counting up rather than down is essential: the stack grows down, so the
+	// deepest excursion leaves its mark at the LOWEST address. Searching from the
+	// top would find the edge of the currently-live frame, which is shallower and
+	// would understate usage.
+	const uint8_t *byte = stack_bottom;
+	const uint8_t *top  = stack_top;
+	uint32_t unused = 0;
+
+	while (byte < top && *byte == (uint8_t)STACK_FILL_BYTE) {
+		byte++;
+		unused++;
 	}
 
-	// Bytes between the deepest point reached and the top of the region.
-	return (uint32_t)((uintptr_t)&_estack - (uintptr_t)word);
+	// Used = region size minus the run of surviving fill at the bottom.
+	return (uint32_t)((uintptr_t)top - (uintptr_t)stack_bottom) - unused;
 }
 
 
 uint32_t stack_probe_size(void)
 {
-	return (uint32_t)((uintptr_t)&_estack - (uintptr_t)&_sstack);
+	return (uint32_t)((uintptr_t)stack_top - (uintptr_t)stack_bottom);
 }
 
 
@@ -106,5 +134,5 @@ bool stack_probe_overflowed(void)
 	// passed _sstack. On a part with no MPU that is not a fault, it is silent
 	// corruption of whatever .bss sits below -- so this is the difference
 	// between "used a lot" and "already broke something".
-	return _sstack != STACK_PAINT;
+	return *stack_bottom != (uint8_t)STACK_FILL_BYTE;
 }
