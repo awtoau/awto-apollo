@@ -56,4 +56,29 @@ uint8_t spi_send_byte(spi_target_t port, uint8_t data);
  */
 void spi_send(spi_target_t port, void *data_to_send, void *data_received, size_t length);
 
+
+/**
+ * Sends a block of data over the SPI bus WITHOUT waiting for it to finish.
+ *
+ * The polled spi_send() above spins on the SERCOM flags for the whole transfer --
+ * about 700 us for 1024 bytes -- during which tud_task() cannot run and the device
+ * NAKs the host. This hands the transfer to the DMAC and returns, so the main loop
+ * keeps servicing USB while the bytes are on the wire.
+ *
+ * @return true if a DMA transfer was armed, in which case the caller MUST poll
+ *         spi_send_done() before touching either buffer or starting another transfer.
+ *         false if the transfer went down the polled path instead -- short transfers
+ *         and non-JTAG targets -- and is therefore already complete on return.
+ */
+bool spi_send_async(spi_target_t port, void *data_to_send, void *data_received, size_t length);
+
+
+/**
+ * Whether the transfer armed by spi_send_async() has finished.
+ *
+ * A single register read, cheap enough to call on every pass of the main loop. Returns
+ * true when nothing is outstanding, so it is safe to call unconditionally.
+ */
+bool spi_send_done(void);
+
 #endif

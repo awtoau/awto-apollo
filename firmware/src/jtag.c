@@ -98,7 +98,7 @@ uint8_t *const console_rx_ring = comms.console_ring;
 // context via tud_task() while jtag_scan_task() runs from the main loop, and both
 // read it. The SAMD11 is single-core with no store buffer, so volatile is
 // sufficient here -- there is no reordering to fence against, only a compiler that
-// would otherwise cache the value in a register across the spin in spi_send().
+// would otherwise cache the value in a register across a scan.
 static volatile bool fill_is_alt = false;
 
 // A scan the host has asked for but which has not been clocked yet.
@@ -107,16 +107,30 @@ static volatile bool fill_is_alt = false;
 // loop notices `pending` and does the clocking. Everything the scan needs must be
 // captured here, because by the time it runs the control request that described it
 // is long gone.
+// Field order is for packing: the uint16_t leads so its 2-byte alignment does not
+// insert a pad after a leading bool, which is what a natural reading order costs.
+//
+// There is no `discard_tdo` field. Only discarding scans are ever deferred -- a
+// capturing scan is run inline by handle_jtag_request_scan(), because the host's very
+// next request reads TDO back and a deferred scan would answer it with the previous
+// scan's data. So the deferred path's discard_tdo is a constant true, and storing it
+// would only invite someone to set it to something else.
 static struct {
+	// wValue is 16 bits on the wire, so a wider field could not hold a larger request
+	// even in principle -- and the buffer bound is 1024 bytes regardless.
+	uint16_t num_bits;
 	volatile bool     pending;
-	uint32_t num_bits;
 	bool     advance_state;
 	bool     bitbang;
-	bool     discard_tdo;
 	// Which buffer this scan clocks OUT of. Latched at queue time rather than
 	// derived when it runs: fill_is_alt has already flipped by then, so reading it
 	// at run time would clock the buffer the host is currently filling.
 	bool     from_alt;
+	// Whether the scan has been armed on the SERCOM but not yet finished.
+	// Distinguishes "the host asked and nothing has happened yet" from "the DMAC is
+	// clocking it right now", which the task needs in order to know whether to arm or
+	// to poll.
+	bool     started;
 } queued_scan;
 
 // Whether the buffer currently being filled has had data land in it.
@@ -191,16 +205,48 @@ bool jtag_scan(uint32_t num_bits, bool advance_state, bool bitbang,
 }
 
 
+// The bit-level tail of a scan whose bulk is currently being clocked by DMA.
+//
+// jtag_scan_start() arms the DMA and returns, so the remaining work -- releasing the
+// pinmux and bitbanging any leftover bits -- has to survive until a later pass of the
+// main loop sees the transfer finish. Captured here rather than recomputed, because
+// the buffer alternation means the source pointer is not derivable after the fact.
+// Field order is chosen for packing, not for reading order: the pointer must be
+// 4-aligned, so the four sub-word fields are grouped ahead of it and fill exactly one
+// word. Put the uint16_t first, ahead of the two bytes, or its own 2-byte alignment
+// inserts a pad and the struct rounds up to 12 -- which is what a natural reading order
+// produces, and on a part with a few hundred spare bytes of RAM those four matter.
+//
+// No "is the DMA running" flag of its own: spi_send_done() already tracks that, and
+// returns true when nothing is outstanding, so asking it unconditionally is correct for
+// both the DMA'd and the polled-fallback case.
+static struct {
+	// How far into jtag_in_buffer the tail's received bits go -- the same value as the
+	// bulk byte count, kept as an offset because that is its only use. Bounded by
+	// JTAG_BUFFER_SIZE, so 16 bits is ample.
+	uint16_t       slow_offset;
+	// At most 8 bits, so one byte.
+	uint8_t        slow_bits;
+	bool           advance_state;
+	// Where the leftover bits come from: the byte just past the DMA'd block, in
+	// whichever of the two transmit buffers this scan came from. Stored already-offset
+	// rather than as a buffer plus a bulk length, so this is one pointer instead of a
+	// pointer plus a count.
+	uint8_t       *slow_source;
+} scan_tail;
+
+
 /**
- * Performs a JTAG scan out of an explicitly named buffer.
+ * Starts a scan, handing the bulk of it to DMA and returning before it completes.
  *
- * Split out from jtag_scan() because with two buffers alternating, the source is no
- * longer implied. The overlapped path must clock the buffer that was filled one
- * chunk ago, not the one being filled now, and a function that consulted
- * fill_is_alt itself could not express that.
+ * The caller must drive jtag_scan_finish_step() until it reports done before touching
+ * either buffer or starting another scan.
+ *
+ * @return true if the scan was started; false if the request was invalid, in which
+ *         case nothing was armed and no tail is owed.
  */
-bool jtag_scan_from(uint8_t *out_buffer, uint32_t num_bits, bool advance_state,
-                    bool bitbang, bool discard_tdo)
+static bool jtag_scan_start(uint8_t *out_buffer, uint32_t num_bits,
+                            bool advance_state, bool bitbang, bool discard_tdo)
 {
 	// Our bulk method can only send whole bytes; so send as many bytes as we can
 	// using the fast method; and then send the remainder using our slow method.
@@ -246,21 +292,84 @@ bool jtag_scan_from(uint8_t *out_buffer, uint32_t num_bits, bool advance_state,
 		bits_to_send_slow = 8;
 	}
 
-	// Switch to SPI mode, and send the bulk of the transfer using it.
+	scan_tail.slow_source   = out_buffer + bytes_to_send_bulk;
+	scan_tail.slow_offset   = bytes_to_send_bulk;
+	scan_tail.slow_bits     = bits_to_send_slow;
+	scan_tail.advance_state = advance_state;
+
+	// Switch to SPI mode, and hand the bulk of the transfer to the DMAC.
 	if (bytes_to_send_bulk) {
 		spi_configure_pinmux(SPI_FPGA_JTAG);
 		// NULL receive means "clock these out and drop what comes back", so the
 		// receive buffer is untouched on the write path.
-		spi_send(SPI_FPGA_JTAG, out_buffer,
-		         discard_tdo ? NULL : jtag_in_buffer, bytes_to_send_bulk);
+		//
+		// The return value is discarded: it distinguishes "armed, poll for it" from
+		// "already done on the polled fallback", and spi_send_done() answers both.
+		(void)spi_send_async(SPI_FPGA_JTAG, out_buffer,
+		                     discard_tdo ? NULL : jtag_in_buffer,
+		                     bytes_to_send_bulk);
 	}
 
-	// Switch back to GPIO mode, and send the remainder using the slow method.
-	spi_release_pinmux(SPI_FPGA_JTAG);
-	if (bits_to_send_slow) {
-		jtag_tap_shift(out_buffer + bytes_to_send_bulk, jtag_in_buffer + bytes_to_send_bulk,
-				bits_to_send_slow, advance_state);
+	return true;
+}
+
+
+/**
+ * Completes a scan started by jtag_scan_start(), if the DMA has finished.
+ *
+ * @return true when the scan is fully complete -- including the bitbanged tail -- and
+ *         false while the DMA still has bytes on the wire.
+ *
+ * Not a wait: one register read, then either the tail work or an immediate return. The
+ * caller decides whether to spin (jtag_scan_drain()) or come back next loop pass
+ * (jtag_scan_task()).
+ */
+static bool jtag_scan_finish_step(void)
+{
+	if (!spi_send_done()) {
+		return false;
 	}
+
+	// Switch back to GPIO mode, and send the remainder using the slow method. This
+	// must happen AFTER the DMA has drained: releasing the pinmux mid-transfer would
+	// pull TCK away from the SERCOM with bytes still queued.
+	spi_release_pinmux(SPI_FPGA_JTAG);
+	if (scan_tail.slow_bits) {
+		jtag_tap_shift(scan_tail.slow_source,
+		               jtag_in_buffer + scan_tail.slow_offset,
+		               scan_tail.slow_bits, scan_tail.advance_state);
+		// Cleared so a second finish step cannot re-shift these bits.
+		scan_tail.slow_bits = 0;
+	}
+
+	return true;
+}
+
+
+/**
+ * Performs a JTAG scan out of an explicitly named buffer, returning only once the
+ * whole scan has been clocked.
+ *
+ * Split out from jtag_scan() because with two buffers alternating, the source is no
+ * longer implied. The overlapped path must clock the buffer that was filled one
+ * chunk ago, not the one being filled now, and a function that consulted
+ * fill_is_alt itself could not express that.
+ *
+ * Implemented as start-then-spin over the same two steps the deferred path uses, so
+ * there is one copy of the bit splitting and the buffer bounds rather than two that
+ * can drift apart. The spin is bounded by the DMAC's transfer-complete flag, which
+ * the SERCOM's own clock guarantees will arrive -- ~700 us for a full 1024 bytes --
+ * and a transfer that could not complete raises TERR, which also ends the spin.
+ */
+bool jtag_scan_from(uint8_t *out_buffer, uint32_t num_bits, bool advance_state,
+                    bool bitbang, bool discard_tdo)
+{
+	if (!jtag_scan_start(out_buffer, num_bits, advance_state, bitbang,
+	                     discard_tdo)) {
+		return false;
+	}
+
+	while (!jtag_scan_finish_step());
 
 	return true;
 }
@@ -354,7 +463,7 @@ bool handle_jtag_request_set_out_buffer(uint8_t rhport, tusb_control_request_t c
 	// That asynchrony is what makes the overlap possible rather than being an
 	// obstacle to it: dcd_samd.c sets bank->ADDR.reg to this pointer and the
 	// peripheral moves the bytes in on its own, so the CPU is free to return here
-	// and then spin in spi_send() clocking the other buffer. The fill completing is
+	// and then arm the DMAC to clock the other buffer. The fill completing is
 	// observed at CONTROL_STAGE_DATA -- see handle_jtag_request_set_out_buffer_complete().
 	return tud_control_xfer(rhport, request, fill, request->wLength);
 }
@@ -468,7 +577,6 @@ bool handle_jtag_request_scan(uint8_t rhport, tusb_control_request_t const* requ
 	queued_scan.num_bits      = request->wValue;
 	queued_scan.advance_state = request->wIndex & FLAG_ADVANCE_STATE;
 	queued_scan.bitbang       = request->wIndex & FLAG_FORCE_BITBANG;
-	queued_scan.discard_tdo   = true;
 	// Latch which buffer to clock BEFORE flipping, so the scan reads the buffer the
 	// host just filled rather than the one it is about to fill next.
 	queued_scan.from_alt      = fill_is_alt;
@@ -495,10 +603,29 @@ void jtag_scan_task(void)
 		return;
 	}
 
-	jtag_scan_from(queued_scan.from_alt ? jtag_tx_alt : comms.jtag_tx,
-	               queued_scan.num_bits, queued_scan.advance_state,
-	               queued_scan.bitbang, queued_scan.discard_tdo);
+	// First visit for this scan: arm it and get straight back to the main loop, so
+	// tud_task() runs while the DMAC clocks. That return is the whole point -- the
+	// old code spun here for the entire transfer and the device NAKed throughout.
+	if (!queued_scan.started) {
+		if (!jtag_scan_start(queued_scan.from_alt ? jtag_tx_alt : comms.jtag_tx,
+		                     queued_scan.num_bits, queued_scan.advance_state,
+		                     queued_scan.bitbang, true)) {
+			// Invalid request, already validated at queue time, so this should be
+			// unreachable. Drop it rather than retrying forever: the main loop has
+			// no control transfer left to stall.
+			queued_scan.pending = false;
+			return;
+		}
+		queued_scan.started = true;
+	}
 
+	// Subsequent visits: one register read to ask whether the wire is clear. Cheap
+	// enough to do on every loop pass, which is what replaces the 700 us spin.
+	if (!jtag_scan_finish_step()) {
+		return;
+	}
+
+	queued_scan.started = false;
 	// Cleared last, so that a SET_OUT_BUFFER arriving during the clocking above sees
 	// the scan as still pending and waits if it targets this buffer.
 	queued_scan.pending = false;
@@ -511,12 +638,13 @@ void jtag_scan_task(void)
 void jtag_scan_drain(void)
 {
 	// Not a wait on a duration, and deliberately not a timeout. The only work that
-	// can be outstanding is one spi_send() of at most JTAG_BUFFER_SIZE bytes, whose
-	// loop is bounded by the SERCOM's own DRE/RXC flags -- about 700 us at 12 MHz
-	// SCK for a full 1024-byte buffer. Running it here rather than waiting for the
-	// main loop to reach it means there is nothing to time out ON: the work is done
-	// inline and this returns when it is complete.
-	if (queued_scan.pending) {
+	// can be outstanding is one transfer of at most JTAG_BUFFER_SIZE bytes -- about
+	// 700 us at 12 MHz SCK for a full 1024-byte buffer -- whose completion is
+	// signalled by the DMAC's own transfer-complete flag (or by the SERCOM's DRE/RXC
+	// flags on the polled fallback). There is nothing to time out ON: the hardware
+	// clock guarantees the flag arrives, and a transfer that could not complete
+	// raises TERR, which spi_send_done() also reports as finished.
+	while (queued_scan.pending) {
 		jtag_scan_task();
 	}
 }
@@ -592,7 +720,13 @@ bool handle_jtag_start(uint8_t rhport, tusb_control_request_t const* request)
 	//
 	// JTAG_START is the right place: the host issues exactly one per session, and
 	// the alternation is meaningless outside a session.
-	queued_scan.pending = false;
+	//
+	// Drained rather than simply discarded. The scan is now clocked by the DMAC, so a
+	// pending scan may have channels armed and writing into one of these buffers; just
+	// clearing the flag would leave that transfer running into a buffer the new session
+	// believes it owns. Letting it finish costs at most one 1024-byte transfer.
+	jtag_scan_drain();
+
 	fill_is_alt         = false;
 	staged_valid        = false;
 	staged_bytes        = 0;

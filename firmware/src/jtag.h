@@ -101,12 +101,17 @@ uint8_t *jtag_fill_buffer(void);
 bool jtag_scan_pending(void);
 
 /**
- * Clocks out a scan queued by handle_jtag_request_scan(), if there is one.
+ * Advances a scan queued by handle_jtag_request_scan(), if there is one.
  *
  * Called from the main loop rather than from the request handler: the handler
  * returns as soon as the scan is queued, which frees the host to stage the next
  * chunk over USB while this clocks the previous one. That overlap is the entire
  * point -- see the comment on jtag_queue_scan() in jtag.c.
+ *
+ * Must be called repeatedly, and does NOT clock a whole scan per call. The first
+ * call hands the transfer to the DMAC and returns immediately, so tud_task() keeps
+ * running while the bytes are on the wire; subsequent calls read one DMAC flag and
+ * finish the scan once it retires.
  */
 void jtag_scan_task(void);
 
@@ -114,9 +119,10 @@ void jtag_scan_task(void);
  * Blocks until any queued scan has finished clocking.
  *
  * Bounded by the work already queued -- at most JTAG_BUFFER_SIZE bytes at 12 MHz
- * SCK, about 700 us -- and not by a timeout, because the SERCOM loop it waits on
- * is itself bounded and cannot fail to terminate. On return the previously
- * queued scan is complete and both buffers are idle.
+ * SCK, about 700 us -- and not by a timeout, because completion is signalled by the
+ * DMAC's own transfer-complete flag, which the SERCOM's clock guarantees will arrive.
+ * A transfer that could not complete raises TERR, which also ends the wait. On return
+ * the previously queued scan is complete and both buffers are idle.
  */
 void jtag_scan_drain(void);
 

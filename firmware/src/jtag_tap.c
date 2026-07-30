@@ -158,6 +158,12 @@ void jtag_init(void)
 	// pins) rather than refuse and leave a half-set-up chain.
 	apollo_mode_acquire_jtag();
 
+	// A queued scan is now clocked by the DMAC and may be mid-transfer, with the
+	// SERCOM owning TCK/TDI/TDO. Taking those pins back to GPIO underneath it would
+	// stop the clock with bytes still queued and leave the TAP at an unknown bit
+	// position. Bounded by the one outstanding transfer, at most ~700 us.
+	jtag_scan_drain();
+
 	gpio_set_pin_level(TCK_GPIO, false);
 
 	// Set up each of our JTAG pins.
@@ -181,6 +187,10 @@ void jtag_deinit(void)
 	static const uint16_t gpio_pins[] = {
 		TDO_GPIO, TDI_GPIO, TCK_GPIO, TMS_GPIO,
 	};
+
+	// Same reason as jtag_init(): stop driving the chain only once the DMAC has
+	// finished driving it, or the last bytes of a transfer are clocked into nothing.
+	jtag_scan_drain();
 
 	// Reset each of the JTAG pins to its unused state.
 	// FIXME: apply the recommended pull resistors?

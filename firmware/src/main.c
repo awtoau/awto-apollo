@@ -100,11 +100,16 @@ int main(void)
 		// microsecond between the request arriving and the clocking starting is a
 		// microsecond of overlap lost.
 		//
-		// It runs to completion rather than in slices: spi_send() is a blocking spin
-		// on the SERCOM flags, and the USB peripheral fills the other buffer by DMA
-		// with no CPU involvement, so nothing needs the CPU meanwhile. A 1024-byte
-		// scan holds it for about 700 us at 12 MHz SCK, which is well inside the
-		// host's control-transfer timeout for the request that follows.
+		// It does NOT run to completion. The clocking is handed to the DMAC and this
+		// returns immediately, so tud_task() above keeps servicing USB while the bytes
+		// are on the wire; later passes poll one DMAC flag and finish the scan when it
+		// retires. That is the point of calling it every iteration rather than once.
+		//
+		// The earlier version spun on the SERCOM flags for the whole chunk -- about
+		// 700 us for 1024 bytes -- during which tud_task() could not run at all and
+		// the device NAKed the host's next request until the loop came round. Measured
+		// at ~98 us of NAK per USB transaction; removing it is worth about 20% of the
+		// configure time.
 		jtag_scan_task();
 		console_task();
 		led_task();
