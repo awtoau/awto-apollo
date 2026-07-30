@@ -46,18 +46,36 @@
 // The risk this takes on: a wrong exclusivity assumption stops being a dropped
 // console byte and becomes a corrupted bitstream mid-configure. The JTAG lock is
 // what makes that not merely unlikely but structurally impossible.
+// The pool is one region, carved differently depending on direction.
+//
+// A write does not read TDO -- the ECP5 self-validates by CRC, so ecp5.py passes
+// ignore_response=True and FLAG_DISCARD_TDO makes spi_send() discard rather than
+// store. So on the write path the receive half is dead space, and the transmit
+// buffer may have the whole region: JTAG_BUFFER_SIZE bytes rather than half that.
+//
+// A read still needs somewhere to put TDO, so jtag_in_buffer points at the second
+// half and is bounded by JTAG_READ_BUFFER_SIZE. That asymmetry is the whole point:
+// writes are the bulk case at hundreds of chunks per configure, reads are a handful
+// of bytes for IDCODE and status.
+//
+// What makes it safe is that the two are never live together. spi_send() takes both
+// pointers in one call, so if a scan ever both transmitted a full-region payload AND
+// captured TDO, the capture would overwrite the second half of the data still being
+// clocked out. FLAG_DISCARD_TDO is what prevents that, and the assertion below is
+// what stops the two definitions drifting apart.
+#define JTAG_READ_BUFFER_SIZE (JTAG_BUFFER_SIZE / 2u)
+
 union comms_buffers {
-	struct {
-		uint8_t in[JTAG_BUFFER_SIZE];
-		uint8_t out[JTAG_BUFFER_SIZE];
-	} jtag;
+	uint8_t jtag_tx[JTAG_BUFFER_SIZE];
 	uint8_t console_ring[CONSOLE_RING_SIZE];
 };
 
 static union comms_buffers comms __attribute__((aligned(4)));
 
-uint8_t *const jtag_in_buffer  = comms.jtag.in;
-uint8_t *const jtag_out_buffer = comms.jtag.out;
+uint8_t *const jtag_out_buffer = comms.jtag_tx;
+// Second half of the same region. Valid only while TDO is being captured, which
+// FLAG_DISCARD_TDO guarantees is never during a full-region write.
+uint8_t *const jtag_in_buffer  = comms.jtag_tx + JTAG_READ_BUFFER_SIZE;
 uint8_t *const console_rx_ring = comms.console_ring;
 
 
@@ -92,6 +110,13 @@ bool jtag_scan(uint32_t num_bits, bool advance_state, bool bitbang,
 
 	// We can't handle 0-byte transfers; fail out.
 	if (!bits_to_send_slow && !bytes_to_send_bulk) {
+		return false;
+	}
+
+	// A scan that captures TDO is bounded by the READ buffer, since TDO lands in the
+	// second half of the region the payload occupies. Without this a large capturing
+	// scan would overwrite the data it was still clocking out.
+	if (!discard_tdo && bytes_to_send_bulk > JTAG_READ_BUFFER_SIZE) {
 		return false;
 	}
 
@@ -179,9 +204,10 @@ bool handle_jtag_request_get_in_buffer(uint8_t rhport, tusb_control_request_t co
 {
 	uint16_t length = request->wLength;
 
-	// If the user has requested more data than we have, return only what we have.
-	if (length > JTAG_BUFFER_SIZE) {
-		length = JTAG_BUFFER_SIZE;
+	// Bounded by the READ size, not the whole region: jtag_in_buffer is the second
+	// half of the pool, so reading JTAG_BUFFER_SIZE from it would run off the end.
+	if (length > JTAG_READ_BUFFER_SIZE) {
+		length = JTAG_READ_BUFFER_SIZE;
 	}
 
 	// Send up the contents of our IN buffer.
