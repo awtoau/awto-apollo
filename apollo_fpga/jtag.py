@@ -15,6 +15,11 @@ from .protocol.jtag_svf import SVFParser, SVFEventHandler
 
 # Vendor requests that implement our basic JTAG protocol.
 REQUEST_JTAG_START            = 0xbf
+
+# LED override, passed in wValue of JTAG_START. Bit 5 arms it; bits 0-4 select
+# LEDs A-E. Zero leaves the firmware reporting live state, so this is inert
+# unless a caller sets JTAGChain.led_override.
+LED_OVERRIDE_ACTIVE = 0x20
 REQUEST_JTAG_CLEAR_OUT_BUFFER = 0xb0
 REQUEST_JTAG_SET_OUT_BUFFER   = 0xb1
 REQUEST_JTAG_GET_IN_BUFFER    = 0xb2
@@ -109,6 +114,12 @@ class JTAGChain:
 
     # Short name for this type of interface.
     INTERFACE_SHORT_NAME = "jtag"
+
+    # LED override sent in wValue of JTAG_START; see LED_OVERRIDE_ACTIVE above.
+    # Zero means "let the firmware report live state", which is the only
+    # behaviour older firmware has, so leaving this alone is always safe. Set it
+    # on an instance to pin the LEDs while bringing up a board.
+    led_override = 0
 
     STATE_NUMBERS = {
         'RESET':     0,
@@ -233,7 +244,11 @@ class JTAGChain:
 
 
         # Enable our JTAG comms.
-        self.debugger.out_request(REQUEST_JTAG_START)
+        #
+        # wValue carries an optional LED override (bit 5 arms it, bits 0-4 are the
+        # LEDs). Zero means "report live state", which is what this always sends
+        # and what firmware predating the override also does.
+        self.debugger.out_request(REQUEST_JTAG_START, value=self.led_override)
 
         # Move to the test/reset state.
         self.move_to_state('RESET')

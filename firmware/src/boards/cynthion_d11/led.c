@@ -38,6 +38,24 @@ static const led_t led_pins[LED_COUNT] = { LED_A, LED_B, LED_C, LED_D, LED_E };
 
 
 /**
+ * Host-supplied LED override, or zero for "report live state".
+ *
+ * One byte, not a pattern system: bits 0-4 are the five LEDs and bit 5 arms the
+ * override. There is no animation and no scheduling, so this costs a byte of RAM
+ * and a branch -- which is why it can exist at all on a part with ~780 bytes of
+ * flash spare. The old system needed a dedicated request (0xa1), a state machine
+ * and board_millis(); this rides on wValue of a request the host already sends.
+ */
+static uint8_t led_override = 0;
+
+
+void led_set_override(uint8_t value)
+{
+	led_override = value;
+}
+
+
+/**
  * Sets up each of the LEDs for use.
  */
 void led_init(void)
@@ -125,20 +143,33 @@ void leds_on(void)
  * The mapping, which needs no legend:
  *
  *   LED_A (blue)   power -- on whenever Apollo is running
- *   LED_B (pink)   JTAG  -- the uC is driving the JTAG lines, keep the header off
- *   LED_C (white)  FPGA has requested the CONTROL port
+ *   LED_B (pink)   JTAG session open -- the uC owns the JTAG pins, keep the
+ *                  header off
+ *   LED_C (white)  a bitstream is actually being shifted, not merely a session
+ *                  open. This is the difference between "connected" and "busy",
+ *                  which the old sweep animation conveyed only by moving.
  *   LED_D (pink)   FPGA is online and holding the USB port
- *   LED_E (blue)   reserved for fault indication
+ *   LED_E (blue)   unused when reporting live state
  *
  * Being stateless is the point: recomputing five levels per iteration costs a few
  * GPIO stores, and it is what let the scheduling, the animation state, the pattern
- * variable and the USB request all go.
+ * variable and the dedicated USB request all go.
  */
 void led_task(void)
 {
+  // A host override takes the display wholesale, so debugging a board can put a
+  // known value on the LEDs without a request of its own. Bit 5 marks "override
+  // in force"; bits 0-4 are the LEDs, lowest bit first.
+  if (led_override & LED_OVERRIDE_ACTIVE) {
+    for (unsigned i = 0; i < LED_COUNT; ++i) {
+      led_set(led_pins[i], (led_override & (1u << i)) != 0);
+    }
+    return;
+  }
+
   led_set(LED_A, true);
   led_set(LED_B, apollo_mode_jtag_active());
-  led_set(LED_C, fpga_requesting_port());
+  led_set(LED_C, apollo_mode_programming_active());
   led_set(LED_D, fpga_is_online() && fpga_controls_usb_port());
   led_set(LED_E, false);
 }

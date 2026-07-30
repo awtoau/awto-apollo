@@ -706,8 +706,14 @@ bool handle_jtag_get_state(uint8_t rhport, tusb_control_request_t const* request
  */
 bool handle_jtag_start(uint8_t rhport, tusb_control_request_t const* request)
 {
-	// No LED call here: led_task() reads apollo_mode_jtag_active() directly, and
-	// that flag is already set for the whole JTAG session. See led.c.
+	// No LED pattern call here: led_task() reads apollo_mode_jtag_active() and
+	// apollo_mode_programming_active() directly, and both are maintained for the
+	// whole session. See led.c.
+	//
+	// wValue carried nothing before, so it now takes an optional LED override --
+	// bit 5 arms it, bits 0-4 are the LEDs. Zero (what every existing host sends)
+	// means "report live state", so this is backward compatible by construction.
+	led_set_override((uint8_t)(request->wValue & 0xffu));
 
 	// Reset the buffer alternation for the new session.
 	//

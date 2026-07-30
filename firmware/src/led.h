@@ -48,6 +48,20 @@ void led_toggle(led_t led);
 void led_set(led_t led, bool on);
 
 
+/** Set in an override byte to arm it; bits 0-4 are the LEDs, lowest bit first. */
+#define LED_OVERRIDE_ACTIVE 0x20u
+
+
+/**
+ * Overrides the LED display, or restores live state when passed 0.
+ *
+ * Arrives in wValue of JTAG_START, which carried nothing before. Intended for
+ * bringing up a board -- putting a known value on the LEDs -- not for encoding
+ * operations, which is what the removed pattern system did badly.
+ */
+void led_set_override(uint8_t value);
+
+
 /**
  * Drives one LED per subsystem from live state.
  *
