@@ -39,8 +39,19 @@
  */
 #define JTAG_BUFFER_SIZE 512
 
-extern uint8_t jtag_in_buffer[JTAG_BUFFER_SIZE];
-extern uint8_t jtag_out_buffer[JTAG_BUFFER_SIZE];
+/**
+ * Bytes the console RX ring needs. Declared here because it shares storage with
+ * the JTAG buffers -- see the union in jtag.c for why that is safe.
+ */
+#define CONSOLE_RING_SIZE 256
+
+// Pointers into a shared union, NOT arrays. sizeof() on these yields the pointer
+// size, so use JTAG_BUFFER_SIZE for bounds -- a check against sizeof() would
+// silently become a 4-byte limit, which on a request handler is a bound that
+// passes everything real and truncates it.
+extern uint8_t *const jtag_in_buffer;
+extern uint8_t *const jtag_out_buffer;
+extern uint8_t *const console_rx_ring;
 
 typedef enum e_TAPState
 {

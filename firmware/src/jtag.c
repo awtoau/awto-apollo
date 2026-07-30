@@ -27,9 +27,38 @@
 #define ISC_DISABLE 0x26
 
 
-// JTAG comms buffers.
-uint8_t jtag_in_buffer[JTAG_BUFFER_SIZE] __attribute__((aligned(4)));
-uint8_t jtag_out_buffer[JTAG_BUFFER_SIZE] __attribute__((aligned(4)));
+// JTAG comms buffers, sharing storage with the console RX ring.
+//
+// The console ring and the JTAG buffers are never live at the same time, and the
+// separation is enforced rather than conventional: apollo_mode_acquire_jtag() is
+// called in jtag_init() and released in jtag_deinit(), so the lock spans every use
+// of these buffers -- and console_task() returns immediately while it is held, so
+// the ring is neither filled nor drained during a session.
+//
+// That is a stronger argument than the pin sharing. UART and JTAG contending for
+// TDI/TMS explains why they cannot both drive; the lock scope is what proves
+// neither BUFFER is in use while the other is.
+//
+// Worth stating what is NOT aliased: jtag_in_buffer and jtag_out_buffer remain
+// separate. spi_send() takes both in one call, reading TDI from one while writing
+// TDO to the other, so overlapping those two would corrupt every transfer.
+//
+// The risk this takes on: a wrong exclusivity assumption stops being a dropped
+// console byte and becomes a corrupted bitstream mid-configure. The JTAG lock is
+// what makes that not merely unlikely but structurally impossible.
+union comms_buffers {
+	struct {
+		uint8_t in[JTAG_BUFFER_SIZE];
+		uint8_t out[JTAG_BUFFER_SIZE];
+	} jtag;
+	uint8_t console_ring[CONSOLE_RING_SIZE];
+};
+
+static union comms_buffers comms __attribute__((aligned(4)));
+
+uint8_t *const jtag_in_buffer  = comms.jtag.in;
+uint8_t *const jtag_out_buffer = comms.jtag.out;
+uint8_t *const console_rx_ring = comms.console_ring;
 
 
 /**
@@ -57,7 +86,7 @@ bool jtag_scan(uint32_t num_bits, bool advance_state, bool bitbang)
 	}
 
 	// If this would scan more than we have buffer for, fail out.
-	if (bytes_to_send_bulk > sizeof(jtag_out_buffer)) {
+	if (bytes_to_send_bulk > JTAG_BUFFER_SIZE) {
 		return false;
 	}
 
@@ -98,7 +127,7 @@ bool jtag_scan(uint32_t num_bits, bool advance_state, bool bitbang)
  */
 bool handle_jtag_request_clear_out_buffer(uint8_t rhport, tusb_control_request_t const* request)
 {
-	memset(jtag_out_buffer, 0, sizeof(jtag_out_buffer));
+	memset(jtag_out_buffer, 0, JTAG_BUFFER_SIZE);
 	return tud_control_xfer(rhport, request, NULL, 0);
 }
 
@@ -110,7 +139,7 @@ bool handle_jtag_request_clear_out_buffer(uint8_t rhport, tusb_control_request_t
 bool handle_jtag_request_set_out_buffer(uint8_t rhport, tusb_control_request_t const* request)
 {
 	// If we've been handed too much data, stall.
-	if (request->wLength > sizeof(jtag_out_buffer)) {
+	if (request->wLength > JTAG_BUFFER_SIZE) {
 		return false;
 	}
 
@@ -138,8 +167,8 @@ bool handle_jtag_request_get_in_buffer(uint8_t rhport, tusb_control_request_t co
 	uint16_t length = request->wLength;
 
 	// If the user has requested more data than we have, return only what we have.
-	if (length > sizeof(jtag_in_buffer)) {
-		length = sizeof(jtag_in_buffer);
+	if (length > JTAG_BUFFER_SIZE) {
+		length = JTAG_BUFFER_SIZE;
 	}
 
 	// Send up the contents of our IN buffer.
@@ -271,7 +300,7 @@ bool handle_jtag_benchmark(uint8_t rhport, tusb_control_request_t const* request
 
 	// A chunk of 0 means a full buffer; 256 does not fit in the low byte.
 	if (chunk == 0) {
-		chunk = sizeof(jtag_out_buffer);
+		chunk = JTAG_BUFFER_SIZE;
 	}
 	if (repeats == 0) {
 		return false;

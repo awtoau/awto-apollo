@@ -13,6 +13,7 @@
 
 #include "led.h"
 #include "uart.h"
+#include "jtag.h"
 #include "apollo_mode.h"
 
 
@@ -21,9 +22,13 @@ extern bool uart_active;
 
 // UART RX interrupt can fire while TinyUSB is in critical sections.
 // Buffer bytes here and flush them from console_task() in thread context.
-#define UART_RX_RING_SIZE 256
+#define UART_RX_RING_SIZE CONSOLE_RING_SIZE
 
-static volatile uint8_t uart_rx_ring[UART_RX_RING_SIZE];
+// The ring lives in the union shared with the JTAG buffers, declared in jtag.c.
+// Safe because console_task() returns immediately while the JTAG lock is held, so
+// the ring is neither filled nor drained during a JTAG session -- see the union's
+// comment for the full argument.
+#define uart_rx_ring ((volatile uint8_t *)console_rx_ring)
 static volatile uint16_t uart_rx_head = 0;
 static volatile uint16_t uart_rx_tail = 0;
 
