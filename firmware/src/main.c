@@ -34,6 +34,7 @@
 
 #include "board_rev.h"
 #include "led.h"
+#include "stack_probe.h"
 #include "jtag.h"
 #include "fpga.h"
 #include "console.h"
@@ -49,6 +50,10 @@
  */
 int main(void)
 {
+	// Paint before anything else runs, so as little stack usage as possible is
+	// excluded from the measurement. See stack_probe.c.
+	stack_probe_paint();
+
 	board_init();
 	detect_hardware_revision();
 	tusb_init();

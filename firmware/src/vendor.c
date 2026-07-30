@@ -22,6 +22,7 @@
 #include "debug_spi.h"
 #include "usb_switch.h"
 #include "fpga_adv.h"
+#include "stack_probe.h"
 #include "board_rev.h"
 
 #define USB_API_MAJOR 1
@@ -35,6 +36,11 @@ enum {
 	VENDOR_REQUEST_GET_FIRMWARE_VERSION    = 0xa2,
 	VENDOR_REQUEST_GET_USB_API_VERSION     = 0xa3,
 	VENDOR_REQUEST_GET_ADC_READING         = 0xa4,
+
+	// Stack high-water mark, for right-sizing the reservation (#74). Grouped
+	// with the other read-only status requests rather than given a number of its
+	// own elsewhere; 0xa5 was the next free one.
+	VENDOR_REQUEST_GET_STACK_USAGE         = 0xa5,
 
 	//
 	// JTAG requests.
@@ -215,6 +221,38 @@ static bool handle_get_adc_reading_request(uint8_t rhport, tusb_control_request_
 	uint16_t reading = get_adc_reading();
 	buf[0] = reading >> 8;
 	buf[1] = reading & 0xff;
+	return tud_control_xfer(rhport, request, buf, sizeof(buf));
+}
+
+
+/**
+ * Reports stack usage, so the reservation can be sized from a measurement.
+ *
+ * Returns six bytes, little-endian: high-water mark, region size, then a flags
+ * byte and a zero. Both figures are sent rather than just the mark, so the host
+ * does not have to know the reservation independently -- it changes with
+ * -Wl,--defsym=STACK_SIZE, and a host comparing against a stale constant would
+ * silently misreport the headroom.
+ *
+ * Flags bit 0 is "overflowed": the paint reached the bottom of the region. That
+ * needs its own bit because this part has no MPU, so an overflow is silent
+ * corruption of whatever .bss sits below rather than a fault, and a high-water
+ * figure equal to the region size cannot distinguish "used exactly everything"
+ * from "went past the end".
+ */
+static bool handle_get_stack_usage_request(uint8_t rhport, tusb_control_request_t const* request)
+{
+	static uint8_t buf[6];
+	uint32_t high_water = stack_probe_high_water();
+	uint32_t size       = stack_probe_size();
+
+	buf[0] = high_water & 0xff;
+	buf[1] = (high_water >> 8) & 0xff;
+	buf[2] = size & 0xff;
+	buf[3] = (size >> 8) & 0xff;
+	buf[4] = stack_probe_overflowed() ? 1 : 0;
+	buf[5] = 0;
+
 	return tud_control_xfer(rhport, request, buf, sizeof(buf));
 }
 
@@ -480,6 +518,8 @@ static bool handle_vendor_request_setup(uint8_t rhport, tusb_control_request_t c
 	switch(request->bRequest) {
 		case VENDOR_REQUEST_GET_ADC_READING:
 			return handle_get_adc_reading_request(rhport, request);
+		case VENDOR_REQUEST_GET_STACK_USAGE:
+			return handle_get_stack_usage_request(rhport, request);
 		case VENDOR_REQUEST_GET_ID:
 			return handle_get_id_request(rhport, request);
 		case VENDOR_REQUEST_GET_FIRMWARE_VERSION:
