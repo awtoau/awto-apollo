@@ -56,6 +56,7 @@ enum {
 	VENDOR_REQUEST_JTAG_GOTO_STATE         = 0xb5,
 	VENDOR_REQUEST_JTAG_GET_STATE          = 0xb6,
 	VENDOR_REQUEST_JTAG_BULK_SCAN          = 0xb7,
+	VENDOR_REQUEST_JTAG_GET_INFO           = 0xb8,
 	VENDOR_REQUEST_JTAG_BENCHMARK          = 0xb9,
 
 	// General programming requests.
@@ -254,6 +255,39 @@ static bool handle_get_stack_usage_request(uint8_t rhport, tusb_control_request_
 	buf[5] = 0;
 
 	return tud_control_xfer(rhport, request, buf, sizeof(buf));
+}
+
+
+/**
+ * Reports the JTAG buffer size and platform quirks, so the host sizes its
+ * transactions from what this firmware actually has.
+ *
+ * apollo_fpga/jtag.py:185-192 issues this on every connection and reads eight
+ * bytes: the buffer size as a little-endian u32, then a quirks bitmask. When the
+ * request is unimplemented the host catches the stall and falls back to 256 --
+ * which is what happened here, so raising JTAG_BUFFER_SIZE alone would have
+ * changed nothing observable. The negotiation already existed; only this end was
+ * missing.
+ *
+ * Quirks are reported as zero. QUIRK_FLIP_BITS_IN_WHOLE_BYTES and
+ * QUIRK_ALWAYS_BITBANG_JTAG describe platforms this one is not: the d11 shifts
+ * LSB-first over SERCOM and uses the hardware SPI path for bulk scans.
+ */
+static bool handle_jtag_get_info_request(uint8_t rhport, tusb_control_request_t const* request)
+{
+	static uint8_t info[8];
+	uint32_t size = JTAG_BUFFER_SIZE;
+
+	info[0] = size & 0xff;
+	info[1] = (size >> 8) & 0xff;
+	info[2] = (size >> 16) & 0xff;
+	info[3] = (size >> 24) & 0xff;
+	info[4] = 0;
+	info[5] = 0;
+	info[6] = 0;
+	info[7] = 0;
+
+	return tud_control_xfer(rhport, request, info, sizeof(info));
 }
 
 
@@ -558,6 +592,8 @@ static bool handle_vendor_request_setup(uint8_t rhport, tusb_control_request_t c
 			return handle_jtag_stop(rhport, request);
 		case VENDOR_REQUEST_JTAG_GET_STATE:
 			return handle_jtag_get_state(rhport, request);
+		case VENDOR_REQUEST_JTAG_GET_INFO:
+			return handle_jtag_get_info_request(rhport, request);
 		case VENDOR_REQUEST_JTAG_BENCHMARK:
 			return handle_jtag_benchmark(rhport, request);
 
