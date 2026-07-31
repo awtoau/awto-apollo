@@ -74,6 +74,47 @@ ECPPLL = _find_ecppll()
 USB_CLOCK_TOLERANCE_PCT = 0.5
 
 
+# ECP5 EHXPLLL limits, from the datasheet. The VCO must sit in this window; each of the
+# four outputs then divides it independently.
+VCO_MIN_MHZ = 400.0
+VCO_MAX_MHZ = 800.0
+MAX_DIV = 128
+
+
+def _solve_both(sync_mhz, usb_mhz=60.0, input_mhz=60.0, tolerance=0.001):
+    """Find PLL dividers giving `sync_mhz` AND `usb_mhz` exactly, or None.
+
+    ecppll optimises for its primary output and lets the secondary land wherever the
+    resulting VCO puts it. That is why asking it for 80/60 returns usb at 62.222 MHz --
+    3.7% out, so the PHY does not enumerate. It is a property of the heuristic, not of
+    the hardware: the outputs have independent dividers, and choosing the VCO to serve
+    both is a search ecppll simply does not run.
+
+    Searching it directly finds exact solutions for 80, 90, 100, 110 and 120 MHz, all
+    with usb at 60.000. Those frequencies were previously reported as unreachable.
+
+    Returns (vco_mhz, clki_div, clkfb_div, clkop_div, clkos_div).
+    """
+    # FEEDBK_PATH is "CLKOP", so the feedback divider counts OUTPUT periods, not VCO
+    # periods: VCO = input * CLKFB_DIV * CLKOP_DIV / CLKI_DIV. Treating CLKFB_DIV as a
+    # plain VCO multiplier is exactly the mistake this file's header warns about -- an
+    # earlier attempt produced clocks at twice the requested rate and was abandoned as
+    # "the dividers do not behave as documented". Verified against ecppll, which returns
+    # CLKI_DIV=2 CLKFB_DIV=3 CLKOP_DIV=7 for 90 MHz: 60 * 3 * 7 / 2 = 630 MHz VCO.
+    for clki_div in range(1, 8):
+        for clkop_div in range(1, MAX_DIV + 1):
+            for clkfb_div in range(1, 81):
+                vco = input_mhz * clkfb_div * clkop_div / clki_div
+                if not VCO_MIN_MHZ <= vco <= VCO_MAX_MHZ:
+                    continue
+                if abs(vco / clkop_div - sync_mhz) > tolerance:
+                    continue
+                for clkos_div in range(1, MAX_DIV + 1):
+                    if abs(vco / clkos_div - usb_mhz) <= tolerance:
+                        return vco, clki_div, clkfb_div, clkop_div, clkos_div
+    return None
+
+
 def _ecppll(sync_mhz, input_mhz=60.0):
     """ Ask ecppll for a configuration, returning its parameters as a dict.
 
@@ -123,7 +164,22 @@ class VariableClockDomainGenerator(Elaboratable):
 
     def __init__(self, *, sync_mhz=60.0, input_mhz=60.0):
         self.requested_sync_mhz = sync_mhz
-        self._params = _ecppll(sync_mhz, input_mhz)
+
+        # Solve for both outputs first. ecppll only optimises the primary, which is what
+        # made 80, 90 and 110 MHz look unreachable -- they are not, and this finds them.
+        solved = _solve_both(sync_mhz, 60.0, input_mhz)
+        if solved:
+            vco, clki_div, clkfb_div, clkop_div, clkos_div = solved
+            self._params = {"CLKI_DIV": clki_div, "CLKFB_DIV": clkfb_div,
+                            "CLKOP_DIV": clkop_div, "_vco_mhz": vco,
+                            "_actual_mhz": vco / clkop_div}
+            self._solved_usb_div = clkos_div
+        else:
+            # No exact pair exists; fall back to ecppll and let the usb check below
+            # decide whether the result is usable.
+            self._params = _ecppll(sync_mhz, input_mhz)
+            self._solved_usb_div = None
+
         self.actual_sync_mhz = self._params.get("_actual_mhz", sync_mhz)
         self.vco_mhz = self._params.get("_vco_mhz")
 
@@ -136,7 +192,8 @@ class VariableClockDomainGenerator(Elaboratable):
         # before a platform is involved -- the answer depends only on the PLL
         # parameters, and a caller sweeping frequencies should learn which ones
         # are legal without needing to build.
-        self.usb_div = int(round(self.vco_mhz / 60.0))
+        self.usb_div = (self._solved_usb_div if self._solved_usb_div
+                        else int(round(self.vco_mhz / 60.0)))
         self.actual_usb_mhz = self.vco_mhz / self.usb_div
         self.usb_error_pct = 100.0 * (self.actual_usb_mhz - 60.0) / 60.0
         if abs(self.usb_error_pct) > USB_CLOCK_TOLERANCE_PCT:
