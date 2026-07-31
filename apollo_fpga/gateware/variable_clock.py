@@ -58,6 +58,22 @@ def _find_ecppll():
 ECPPLL = _find_ecppll()
 
 
+# How far `usb` may sit from 60 MHz before the build is refused.
+#
+# The ULPI PHY is fed a fixed 60 MHz and has no tolerance to speak of -- this is
+# a source-synchronous parallel interface, not a UART with a resynchronising
+# start bit, so there is no mechanism to absorb a frequency error at all. 0.5%
+# is therefore already permissive; it exists to allow floating-point noise on an
+# exact division rather than to allow real error.
+#
+# Measured consequence of exceeding it: a 90 MHz sync build (usb 63.000 MHz,
+# +5%) placed, packed and configured cleanly and then never appeared on the USB
+# bus, while a 100 MHz build -- a *higher* CPU clock, but usb exactly 60.000 --
+# enumerated at once. The failure mode is a silently dead device, which is why
+# this refuses at build time instead of warning.
+USB_CLOCK_TOLERANCE_PCT = 0.5
+
+
 def _ecppll(sync_mhz, input_mhz=60.0):
     """ Ask ecppll for a configuration, returning its parameters as a dict.
 
@@ -116,6 +132,22 @@ class VariableClockDomainGenerator(Elaboratable):
                          "(VCO %.0f)",
                          sync_mhz, self.actual_sync_mhz, self.vco_mhz or 0)
 
+        # Checked here rather than in elaborate() so it fires on construction,
+        # before a platform is involved -- the answer depends only on the PLL
+        # parameters, and a caller sweeping frequencies should learn which ones
+        # are legal without needing to build.
+        self.usb_div = int(round(self.vco_mhz / 60.0))
+        self.actual_usb_mhz = self.vco_mhz / self.usb_div
+        self.usb_error_pct = 100.0 * (self.actual_usb_mhz - 60.0) / 60.0
+        if abs(self.usb_error_pct) > USB_CLOCK_TOLERANCE_PCT:
+            raise ValueError(
+                f"sync {sync_mhz:g} MHz gives VCO {self.vco_mhz:g} MHz, so "
+                f"usb = {self.vco_mhz:g}/{self.usb_div} = "
+                f"{self.actual_usb_mhz:.3f} MHz ({self.usb_error_pct:+.2f}%). "
+                f"The ULPI PHY needs 60 MHz and the design will not enumerate. "
+                f"Usable frequencies are those whose VCO is a multiple of 60 "
+                f"-- 60, 100 and 120 MHz are the only ones in 60..130.")
+
     def elaborate(self, platform):
         m = Module()
 
@@ -132,7 +164,31 @@ class VariableClockDomainGenerator(Elaboratable):
         # sync comes from CLKOP, which is also the feedback path, so ecppll's
         # CLKOP_DIV/CLKFB_DIV pair is used exactly as given. usb comes from a
         # secondary output divided to 60 MHz.
-        usb_div = int(round((params["_vco_mhz"]) / 60.0))
+        #
+        # That division is an INTEGER, so `usb` only lands on exactly 60 MHz
+        # when the VCO is a whole multiple of 60. It very often is not, and the
+        # error is silent at build time and fatal on the board:
+        #
+        #     sync  90 MHz -> VCO 630 -> div 10 -> usb 63.000 MHz  (+5.00%)
+        #     sync 110 MHz -> VCO 550 -> div  9 -> usb 61.111 MHz  (+1.85%)
+        #     sync  80 MHz -> VCO 560 -> div  9 -> usb 62.222 MHz  (+3.70%)
+        #     sync 100 MHz -> VCO 600 -> div 10 -> usb 60.000 MHz  (exact)
+        #
+        # The ULPI PHY requires 60 MHz. At 63 MHz the design does not enumerate
+        # at all -- measured, not inferred: a 90 MHz build placed and packed
+        # cleanly, configured onto the board, and never appeared on the bus,
+        # while a 100 MHz build (a *higher* sync clock, but an exact 60 MHz
+        # usb) enumerated immediately. So a failure here looks exactly like
+        # "the CPU is too fast" while being nothing of the sort, and it sent an
+        # earlier investigation looking for a timing ceiling that was not
+        # there.
+        #
+        # Refusing to build is the right response. A design whose USB cannot
+        # work is not a design worth loading, and the alternative -- a dead
+        # device with no explanation -- costs far more than a build error.
+        # Validated in __init__, which raises rather than letting a design with
+        # an unusable USB clock reach the board.
+        usb_div = self.usb_div
 
         m.submodules.pll = Instance(
             "EHXPLLL",
