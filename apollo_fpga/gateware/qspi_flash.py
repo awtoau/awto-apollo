@@ -29,7 +29,8 @@ by overriding the one method that builds it. That keeps all of Glasgow's timing
 and framing logic intact, which is the part worth reusing.
 """
 
-from amaranth import Array, Elaboratable, Instance, Module, Mux, Signal
+from amaranth import (Array, ClockSignal, Const, Elaboratable, Instance, Module,
+                      Mux, Signal)
 from amaranth.lib import io, wiring
 
 from glasgow.gateware.ports import PortGroup
@@ -135,20 +136,42 @@ class QSPIFlashController(wiring.Component):
 
         # SCK comes out of a DDR output register, so ddr_o is two bits: bit 0
         # is driven during the first half of the sync cycle, bit 1 during the
-        # second. USRMCLK takes a single clock input, so only bit 0 is
-        # forwarded.
+        # second. USRMCLK takes a single clock input, so a single wire has to
+        # carry both halves.
         #
-        # That is lossless for divisor >= 1, where both halves always hold the
-        # same value and SCK is a whole number of sync cycles. It is NOT
-        # lossless at divisor 0, where a full clock period lives inside one
-        # sync cycle and exists only as the difference between the halves:
-        # keeping bit 0 alone leaves a constant 0, the flash never sees a
-        # clock, and reads return zeros at every sample offset. This is the
-        # sole reason 60 MHz SCK fails; the part is rated to 104 MHz.
+        # `USRMCLKPort.elaborate_buffer` replaces the buffer rather than
+        # feeding it, so `ddr_o` is the DDR buffer's *input* -- unregistered.
+        # Two things follow, and both are faults:
         #
-        # To lift it, serialise both halves through an ODDRX1F clocked at 2x
-        # and drive USRMCLK from its output -- the construction LUNA already
-        # uses for the HyperRAM clock (i_D0/i_D1 -> o_Q).
+        #  - Taking bit 0 alone is lossless only for divisor >= 1, where both
+        #    halves hold the same value and SCK is a whole number of sync
+        #    cycles. At divisor 0 a full SCK period lives inside one sync cycle
+        #    and exists only as the difference between the halves, so bit 0 is
+        #    a constant 0: no clock reaches the flash at all. That is the sole
+        #    reason SCK = sync has never worked, and it caps SCK at sync/2.
+        #  - CS and DQ go through amaranth's ECP5 `DDRBuffer`, which is an
+        #    ODDRX1F and which amaranth documents as costing two pipeline
+        #    stages. SCK bypassing it therefore arrives *early* relative to
+        #    every signal it is supposed to clock.
+        #
+        # An ODDRX1F would fix both -- it serialises the two halves onto one
+        # wire, and it is the same primitive with the same latency the data
+        # pins get. **It cannot be used here.** nextpnr's ECP5 packer refuses
+        # it outright:
+        #
+        #     ERROR: ODDRX1F 'controller.sck_oddr' Q output must be connected
+        #     only to a top level output
+        #
+        # USRMCLK is not a top-level output; it is a macro standing in for a
+        # pad that user logic cannot reach. So the one primitive that would
+        # serialise a DDR pair onto this pin is exactly the one the pin cannot
+        # have, and SCK is structurally capped at sync/2 -- one flash clock per
+        # two fabric clocks -- rather than at sync.
+        #
+        # Reaching a given SCK therefore means building the whole design at
+        # twice that rate, and the ceiling on SCK is the ceiling on the
+        # design's fmax. Lifting it means generating SCK in a 2x `fast` domain
+        # from a plain register, which is legal where the DDR primitive is not.
         m.d.comb += self.sck.eq(self._sck_port.ddr_o[0])
 
         m.submodules.usrmclk = Instance(
@@ -163,8 +186,18 @@ class QSPIFlashController(wiring.Component):
 # Fast Read Quad Output (6Bh): the command and 24-bit address go out on a
 # single lane, then a dummy byte, then data returns on all four. Requires the
 # QE bit in status register 2, which on this board is already set.
-OPCODE_QUAD_READ = 0x6B      # Fast Read Quad Output: address on one lane
+OPCODE_QUAD_READ    = 0x6B   # Fast Read Quad Output: address on one lane
 OPCODE_QUAD_IO_READ = 0xEB   # Fast Read Quad I/O: address on four lanes
+OPCODE_READ         = 0x03   # Read Data: one lane throughout, no dummy
+OPCODE_FAST_READ    = 0x0B   # Fast Read: one lane, one dummy byte
+
+# `read_mode` values. Bit 1 selects a single-lane data phase, which is why the
+# ordering is what it is -- the data-phase operation is one bit test rather
+# than a decode.
+MODE_QUAD_OUT = 0            # 0x6B
+MODE_QUAD_IO  = 1            # 0xEB
+MODE_SINGLE   = 2            # 0x03
+MODE_FAST     = 3            # 0x0B
 
 
 class QuadFlashReader(Elaboratable):
@@ -198,16 +231,35 @@ class QuadFlashReader(Elaboratable):
         self.start       = Signal()
         self.length      = Signal(16)
         self.divisor     = Signal(16)
-        # Select 0xEB (quad I/O) over 0x6B (quad output). Both return data on
-        # four lanes; 0xEB also sends the address on four, which halves the
-        # per-transaction overhead from 40 clocks to 20.
+        # One of MODE_QUAD_OUT / MODE_QUAD_IO / MODE_SINGLE / MODE_FAST.
         #
-        # That is worth little on a long streaming read -- 0.2% at 4 KiB -- and
-        # a great deal on small random ones: 19% for a 32-byte cache line, 28%
+        # 0xEB (quad I/O) sends the address on four lanes as well as the data,
+        # which halves the per-transaction overhead from 40 clocks to 20. That
+        # is worth little on a long streaming read -- 0.2% at 4 KiB -- and a
+        # great deal on small random ones: 19% for a 32-byte cache line, 28%
         # for 16 bytes. The datasheet is explicit that it exists to allow
         # "faster random access for code execution (XIP)", which is exactly the
         # RISC-V-executing-from-flash case rather than the bulk-transfer one.
-        self.quad_io     = Signal()
+        #
+        # The two single-lane modes are here to be a baseline measured by this
+        # same instrument, so a quad figure is compared against a single-lane
+        # one taken through the identical path rather than against a number
+        # from another design.
+        self.read_mode   = Signal(2)
+        # The mode byte M7-0 that 0xEB sends straight after the address.
+        #
+        # M5-4 = (1,0) puts the part into Continuous Read: the *next* 0xEB
+        # transaction omits its opcode entirely, saving 8 clocks. Anything else
+        # leaves it. 0xA0 enters, 0xFF or 0x00 leaves. This is device state,
+        # not controller state -- it survives an FPGA reconfiguration, and a
+        # part left in Continuous Read returns garbage to a reader that starts
+        # sending opcodes again, so `xip` below tracks what was actually sent.
+        self.mode_byte   = Signal(8)
+        # Force the next read to omit the opcode. The recovery knob for a part
+        # left in Continuous Read by a bitstream that is no longer loaded.
+        self.xip_force   = Signal()
+        # High when the part is believed to be in Continuous Read.
+        self.xip         = Signal()
         # Start address. Previously hard-wired to zero, which meant every read
         # hit the same page -- so a burst of reads measured the flash's
         # sequential path repeatedly rather than its random-access one, and
@@ -224,50 +276,95 @@ class QuadFlashReader(Elaboratable):
 
         from glasgow.gateware.qspi import Operation
 
-        # Opcode, three address bytes and one dummy byte, all single-lane.
-        # 0x6B: opcode(x1) + 3 address bytes(x1) + 1 dummy byte(x1) = 5 beats.
-        # 0xEB: opcode(x1) + 3 address bytes(x4) + mode byte(x4) + 2 dummy
-        #       bytes(x4) = 7 beats, but each x4 beat is a quarter the clocks.
+        # Address bytes are most-significant first, as SPI NOR expects. Clock
+        # counts below are per transaction, before the data phase:
         #
-        # The mode byte M7-0 is sent as zero: M5-4 must not be (1,0) or the
-        # device stays in Continuous Read Mode and expects the *next*
-        # transaction to omit its opcode -- which would desynchronise every
-        # following read.
-        # Address bytes are most-significant first, as SPI NOR expects.
+        #   0x03  opcode(x1) + 3 address(x1)                         = 32
+        #   0x0B  opcode(x1) + 3 address(x1) + 1 dummy(x1)           = 40
+        #   0x6B  opcode(x1) + 3 address(x1) + 1 dummy(x1)           = 40
+        #   0xEB  opcode(x1) + 3 address(x4) + mode(x4) + 2 dummy(x4)= 20
+        #   0xEB  in Continuous Read, opcode omitted                 = 12
+        #
+        # An x4 beat is a quarter of the clocks of an x1 beat, which is why
+        # 0xEB has more beats and less latency. The 0xEB dummy is two x4 beats
+        # = 4 clocks, which is what this part specifies for that opcode; the
+        # mode byte is a further 2, for 6 clocks of latency in total.
         addr_hi = self.address[16:24]
         addr_md = self.address[8:16]
         addr_lo = self.address[0:8]
 
-        header_1x    = Array([OPCODE_QUAD_READ, addr_hi, addr_md, addr_lo,
-                              0x00])
-        header_4x    = Array([OPCODE_QUAD_IO_READ, addr_hi, addr_md, addr_lo,
-                              0x00, 0x00, 0x00])
+        header_03 = Array([OPCODE_READ,         addr_hi, addr_md, addr_lo])
+        header_0b = Array([OPCODE_FAST_READ,    addr_hi, addr_md, addr_lo,
+                           0x00])
+        header_6b = Array([OPCODE_QUAD_READ,    addr_hi, addr_md, addr_lo,
+                           0x00])
+        header_eb = Array([OPCODE_QUAD_IO_READ, addr_hi, addr_md, addr_lo,
+                           self.mode_byte, 0x00, 0x00])
+
         header_len   = Signal(range(8))
         header_index = Signal(range(8))
+        header_first = Signal(range(8))
         header_byte  = Signal(8)
         header_oper  = Signal(3)
+        data_oper    = Signal(3)
         bytes_left   = Signal(16)
         received     = Signal(16)
 
-        m.d.comb += header_len.eq(Mux(self.quad_io, len(header_4x),
-                                      len(header_1x)))
-        with m.If(self.quad_io):
-            m.d.comb += header_byte.eq(header_4x[header_index])
-            # Only the opcode goes out on a single lane; address, mode and
-            # dummy all use four.
-            m.d.comb += header_oper.eq(
-                Mux(header_index == 0, Operation.PutX1, Operation.PutX4))
-        with m.Else():
-            m.d.comb += header_byte.eq(header_1x[header_index])
-            m.d.comb += header_oper.eq(Operation.PutX1)
+        # Continuous Read skips index 0 -- the opcode -- and nothing else.
+        skip_opcode = Signal()
+        m.d.comb += [
+            skip_opcode.eq((self.read_mode == MODE_QUAD_IO)
+                           & (self.xip | self.xip_force)),
+            header_first.eq(Mux(skip_opcode, 1, 0)),
+            # Bit 1 of the mode number is exactly "single-lane data phase".
+            data_oper.eq(Mux(self.read_mode[1], Operation.GetX1,
+                             Operation.GetX4)),
+        ]
 
-        m.d.comb += self.ctrl.divisor.eq(self.divisor)
+        with m.Switch(self.read_mode):
+            with m.Case(MODE_QUAD_IO):
+                m.d.comb += [
+                    header_len .eq(len(header_eb)),
+                    header_byte.eq(header_eb[header_index]),
+                    # Only the opcode goes out on a single lane; address, mode
+                    # and dummy all use four.
+                    header_oper.eq(Mux(header_index == 0, Operation.PutX1,
+                                       Operation.PutX4)),
+                ]
+            with m.Case(MODE_SINGLE):
+                m.d.comb += [
+                    header_len .eq(len(header_03)),
+                    header_byte.eq(header_03[header_index]),
+                    header_oper.eq(Operation.PutX1),
+                ]
+            with m.Case(MODE_FAST):
+                m.d.comb += [
+                    header_len .eq(len(header_0b)),
+                    header_byte.eq(header_0b[header_index]),
+                    header_oper.eq(Operation.PutX1),
+                ]
+            with m.Default():
+                m.d.comb += [
+                    header_len .eq(len(header_6b)),
+                    header_byte.eq(header_6b[header_index]),
+                    header_oper.eq(Operation.PutX1),
+                ]
+
+        # Latched at IDLE, not passed through. `divisor` is a host register and
+        # Glasgow's enframer reads it live, comparing it against a free-running
+        # timer -- so a write that lands mid-transaction changes the clock
+        # period between one byte and the next and the flash sees a clock it
+        # was never told about. Same rule the I2C mux follows for its bus
+        # select: a bus parameter changes where the bus is idle.
+        divisor_held = Signal(16)
+        m.d.comb += self.ctrl.divisor.eq(divisor_held)
 
         with m.FSM():
             with m.State("IDLE"):
                 with m.If(self.start):
                     m.d.sync += [
-                        header_index.eq(0),
+                        header_index.eq(header_first),
+                        divisor_held.eq(self.divisor),
                         bytes_left  .eq(self.length),
                         received    .eq(0),
                         self.cycles .eq(0),
@@ -297,7 +394,7 @@ class QuadFlashReader(Elaboratable):
                     # chip 0 deselects, ending the transaction on the last byte
                     self.ctrl.i_stream.payload.chip.eq(
                         Mux(bytes_left == 0, 0, 1)),
-                    self.ctrl.i_stream.payload.oper.eq(Operation.GetX4),
+                    self.ctrl.i_stream.payload.oper.eq(data_oper),
                     self.ctrl.i_stream.payload.data.eq(0),
                     self.ctrl.o_stream.ready    .eq(1),
                 ]
@@ -342,6 +439,16 @@ class QuadFlashReader(Elaboratable):
                 ]
                 with m.If(self.ctrl.i_stream.ready):
                     m.d.sync += self.done.eq(1)
+                    # Track what the part was actually told, not what was
+                    # wanted. A read whose mode byte carried M5-4 = (1,0) left
+                    # it in Continuous Read; any other read, in any other mode,
+                    # took it out. Deriving this from the transaction that just
+                    # happened is what makes leaving Continuous Read a matter
+                    # of doing one ordinary read rather than of remembering to
+                    # clear a flag.
+                    m.d.sync += self.xip.eq(
+                        (self.read_mode == MODE_QUAD_IO)
+                        & (self.mode_byte[4:6] == 0b10))
                     m.next = "IDLE"
 
         return m
