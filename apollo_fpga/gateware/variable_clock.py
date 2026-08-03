@@ -81,7 +81,8 @@ VCO_MAX_MHZ = 800.0
 MAX_DIV = 128
 
 
-def _solve_both(sync_mhz, usb_mhz=60.0, input_mhz=60.0, tolerance=0.001):
+def _solve_both(sync_mhz, usb_mhz=60.0, input_mhz=60.0, tolerance=0.001,
+                fast_ratio=None):
     """Find PLL dividers giving `sync_mhz` AND `usb_mhz` exactly, or None.
 
     ecppll optimises for its primary output and lets the secondary land wherever the
@@ -93,7 +94,15 @@ def _solve_both(sync_mhz, usb_mhz=60.0, input_mhz=60.0, tolerance=0.001):
     Searching it directly finds exact solutions for 80, 90, 100, 110 and 120 MHz, all
     with usb at 60.000. Those frequencies were previously reported as unreachable.
 
-    Returns (vco_mhz, clki_div, clkfb_div, clkop_div, clkos_div).
+    `fast_ratio`, when given, additionally requires an output at `fast_ratio * sync_mhz`
+    -- the `fast` domain HyperRAM's PHY clocks its DDR output registers from. Since every
+    output divides the same VCO, that means CLKOP_DIV must itself be divisible by the
+    ratio, so solutions exist only where it is. Asking for it and silently getting a
+    slightly-wrong `fast` would be the same class of failure as the usb one below, so the
+    constraint is imposed in the search rather than checked afterwards.
+
+    Returns (vco_mhz, clki_div, clkfb_div, clkop_div, clkos_div, clkos2_div); the last is
+    None when `fast_ratio` is None.
     """
     # FEEDBK_PATH is "CLKOP", so the feedback divider counts OUTPUT periods, not VCO
     # periods: VCO = input * CLKFB_DIV * CLKOP_DIV / CLKI_DIV. Treating CLKFB_DIV as a
@@ -109,9 +118,20 @@ def _solve_both(sync_mhz, usb_mhz=60.0, input_mhz=60.0, tolerance=0.001):
                     continue
                 if abs(vco / clkop_div - sync_mhz) > tolerance:
                     continue
+
+                # `fast` divides the same VCO, so it exists only when CLKOP_DIV divides
+                # evenly by the ratio. Rejecting here rather than after the usb match
+                # keeps the search from returning a pair that cannot carry all three.
+                clkos2_div = None
+                if fast_ratio is not None:
+                    if clkop_div % fast_ratio:
+                        continue
+                    clkos2_div = clkop_div // fast_ratio
+
                 for clkos_div in range(1, MAX_DIV + 1):
                     if abs(vco / clkos_div - usb_mhz) <= tolerance:
-                        return vco, clki_div, clkfb_div, clkop_div, clkos_div
+                        return (vco, clki_div, clkfb_div, clkop_div, clkos_div,
+                                clkos2_div)
     return None
 
 
@@ -162,18 +182,37 @@ class VariableClockDomainGenerator(Elaboratable):
         wrong by exactly the rounding error.
     """
 
-    def __init__(self, *, sync_mhz=60.0, input_mhz=60.0):
+    def __init__(self, *, sync_mhz=60.0, input_mhz=60.0, with_fast=False,
+                 fast_ratio=2):
         self.requested_sync_mhz = sync_mhz
+        self.with_fast = with_fast
+        self.fast_ratio = fast_ratio
+        self.fast_div = None
+        self.actual_fast_mhz = None
 
         # Solve for both outputs first. ecppll only optimises the primary, which is what
         # made 80, 90 and 110 MHz look unreachable -- they are not, and this finds them.
-        solved = _solve_both(sync_mhz, 60.0, input_mhz)
+        solved = _solve_both(sync_mhz, 60.0, input_mhz,
+                             fast_ratio=fast_ratio if with_fast else None)
         if solved:
-            vco, clki_div, clkfb_div, clkop_div, clkos_div = solved
+            vco, clki_div, clkfb_div, clkop_div, clkos_div, clkos2_div = solved
             self._params = {"CLKI_DIV": clki_div, "CLKFB_DIV": clkfb_div,
                             "CLKOP_DIV": clkop_div, "_vco_mhz": vco,
                             "_actual_mhz": vco / clkop_div}
             self._solved_usb_div = clkos_div
+            if with_fast:
+                self.fast_div = clkos2_div
+                self.actual_fast_mhz = vco / clkos2_div
+        elif with_fast:
+            # No fallback here. ecppll cannot express a three-output constraint, so
+            # accepting its answer would give a `fast` domain at whatever the VCO
+            # happened to allow -- and HyperRAM clocked from a wrong `fast` corrupts
+            # data rather than failing, which is far worse than not building.
+            raise ValueError(
+                f"no PLL configuration gives sync {sync_mhz:g} MHz, usb 60 MHz and "
+                f"fast {fast_ratio * sync_mhz:g} MHz together. `fast` divides the same "
+                f"VCO as sync, so CLKOP_DIV must be a multiple of {fast_ratio}; try 60 "
+                f"or 100 MHz.")
         else:
             # No exact pair exists; fall back to ecppll and let the usb check below
             # decide whether the result is usable.
@@ -213,7 +252,13 @@ class VariableClockDomainGenerator(Elaboratable):
 
         clk_sync = Signal()
         clk_usb  = Signal()
+        clk_fast = Signal()
         locked   = Signal()
+
+        # `fast` is HyperRAM's DDR clock, at fast_ratio x sync. Only created on request:
+        # an unused domain still consumes a PLL output and a global buffer.
+        if self.with_fast:
+            m.domains.fast = ClockDomain()
 
         params = self._params
         input_clock = platform.request(platform.default_clk).i
@@ -258,6 +303,7 @@ class VariableClockDomainGenerator(Elaboratable):
 
             o_CLKOP=clk_sync,
             o_CLKOS=clk_usb,
+            o_CLKOS2=clk_fast,
             o_LOCK=locked,
 
             p_PLLRST_ENA="DISABLED",
@@ -283,6 +329,11 @@ class VariableClockDomainGenerator(Elaboratable):
             p_CLKOS_CPHASE=usb_div - 1,
             p_CLKOS_FPHASE=0,
 
+            p_CLKOS2_ENABLE="ENABLED" if self.with_fast else "DISABLED",
+            p_CLKOS2_DIV=self.fast_div or 1,
+            p_CLKOS2_CPHASE=(self.fast_div or 1) - 1,
+            p_CLKOS2_FPHASE=0,
+
             a_ICP_CURRENT="12",
             a_LPF_RESISTOR="8",
             a_MFG_ENABLE_FILTEROPAMP="1",
@@ -298,5 +349,11 @@ class VariableClockDomainGenerator(Elaboratable):
             ResetSignal("sync").eq(~locked),
             ResetSignal("usb") .eq(~locked),
         ]
+
+        if self.with_fast:
+            m.d.comb += [
+                ClockSignal("fast").eq(clk_fast),
+                ResetSignal("fast").eq(~locked),
+            ]
 
         return m
