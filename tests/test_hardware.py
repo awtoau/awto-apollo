@@ -714,9 +714,9 @@ class FlashWriteHILTest(unittest.TestCase):
 class PowerMonitorHILTest(unittest.TestCase):
     """Reads the PAC1954 power monitor over the JTAG bring-up gateware.
 
-    Requires ecp5-test/power_monitor/build/top.bit to be loaded first:
+    Requires gateware/probes/power_monitor/build/top.bit to be loaded first:
 
-        apollo configure ecp5-test/power_monitor/build/top.bit
+        apollo configure gateware/probes/power_monitor/build/top.bit
 
     Opt-in rather than automatic because it needs that specific bitstream --
     running it against whatever happens to be in SRAM would fail confusingly
@@ -726,7 +726,7 @@ class PowerMonitorHILTest(unittest.TestCase):
     Non-destructive: reads only, no writes to the device's configuration.
     """
 
-    # Mirrors ecp5-test/power_monitor/registers.py. Duplicated rather than
+    # Mirrors gateware/probes/power_monitor/registers.py. Duplicated rather than
     # imported because that package lives in the workspace, not this repo, and
     # this test must run from an apollo checkout alone.
     JTAG_ID, JTAG_DEV_ADDR, JTAG_REG_ADDR = 1, 2, 3
@@ -767,12 +767,12 @@ class PowerMonitorHILTest(unittest.TestCase):
         except Exception as e:
             raise unittest.SkipTest(
                 f"could not read the applet ID ({type(e).__name__}: {e}); "
-                "load ecp5-test/power_monitor/build/top.bit first")
+                "load gateware/probes/power_monitor/build/top.bit first")
 
         if applet != cls.APPLET_ID:
             raise unittest.SkipTest(
                 f"applet ID is {applet:#010x}, expected {cls.APPLET_ID:#010x}; "
-                "load ecp5-test/power_monitor/build/top.bit first "
+                "load gateware/probes/power_monitor/build/top.bit first "
                 "(FlashWriteHILTest reconfigures the FPGA, so a full-suite run "
                 "will land here)")
 

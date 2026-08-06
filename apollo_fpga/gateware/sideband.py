@@ -409,7 +409,7 @@ class SidebandResponder(Elaboratable):
         # That spread is why this is a real risk and not a formality: the
         # pessimistic end of an unmeasured range lands close enough to matter at
         # 230400. It cannot be settled in simulation -- it needs a scope on T6,
-        # or the open-drain build of ecp5-test/adv_speed, which exists precisely
+        # or the open-drain build of gateware/probes/adv_speed, which exists precisely
         # to find the crossover and whose result was never applied.
         #
         # Correctness wins over rate here regardless: push-pull at both ends is a
