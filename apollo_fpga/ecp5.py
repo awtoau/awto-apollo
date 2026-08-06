@@ -613,15 +613,23 @@ class ECP5CommandBasedProgrammer(ECP5Programmer):
         return status
 
 
-    def _enable_writing_to_flash(self):
-        """ Enables writing to the FPGA's configuration flash. """
+    def _enable_writing_to_flash(self, verify=True):
+        """ Enables writing to the FPGA's configuration flash.
+
+        `verify` reads the status register back to confirm the write-enable latch
+        actually set. That is a full USB round trip -- 3.00 ms measured -- and in
+        a page loop it is paid once per 256 bytes to re-check a bit that either
+        works on the first page or does not work at all. `flash()` verifies on
+        the first page and skips it thereafter, which keeps the diagnostic and
+        drops ~230 round trips from a 59 KiB image.
+        """
 
         self._flash_wait_for_completion()
 
         # Request that the flash enter write-enabled mode...
         self._background_spi_transfer([self.FlashOpcode.ENABLE_WRITE], ignore_response=True)
 
-        if (self._get_flash_status() & self.SPI_FLASH_WRITE_MASK) == 0:
+        if verify and (self._get_flash_status() & self.SPI_FLASH_WRITE_MASK) == 0:
             raise IOError("Flash did not enter a writeable state!")
 
 
@@ -669,17 +677,26 @@ class ECP5CommandBasedProgrammer(ECP5Programmer):
             size    -= chunk_sz
 
 
-    def _flash_write_page(self, address, data):
-        """ Programs a single flash page. """
+    def _flash_write_page(self, address, data, verify_enable=True, wait=True):
+        """ Programs a single flash page.
 
-        self._enable_writing_to_flash()
+        `wait` polls the status register until the program completes. In a page
+        loop that poll is redundant: the next page begins with
+        `_enable_writing_to_flash`, which waits for completion anyway. Skipping
+        it removes one 3.00 ms USB round trip per page, and the caller is then
+        responsible for one final wait after the last page -- which `flash()`
+        does.
+        """
+
+        self._enable_writing_to_flash(verify=verify_enable)
 
         # Send the write command...
         address_bytes = address.to_bytes(3, byteorder='big')
         self._background_spi_transfer([self.FlashOpcode.WRITE_PAGE, *address_bytes, *data], ignore_response=True)
 
         # ... and wait for it to complete.
-        self._flash_wait_for_completion()
+        if wait:
+            self._flash_wait_for_completion()
 
 
     def _flash_read_page(self, address, size):
@@ -731,8 +748,25 @@ class ECP5CommandBasedProgrammer(ECP5Programmer):
             del data_remaining[0:self.SPI_FLASH_PAGE_SIZE]
 
             # Write the relevant page.
-            self._flash_write_page(address, chunk)
+            #
+            # The write-enable latch is verified on the FIRST page only, and the
+            # completion poll is left to the next page's own wait. Each of those
+            # is a USB round trip at 3.00 ms measured, and at 256 bytes a page
+            # they dominate: a 59 KiB image is 231 pages, so three round trips
+            # per page is ~2 s of pure transport against ~0.16 s of actual
+            # W25Q32DV programming.
+            #
+            # This is the same class of change as suppressing the per-chunk
+            # GET_IN_BUFFER on the configuration burst, which cut SRAM configure
+            # time by 1.53x. That path got it; this one never did.
+            first = (address == offset)
+            self._flash_write_page(address, chunk,
+                                   verify_enable=first, wait=False)
             address += len(chunk)
+
+        # The last page has not been waited for, because the loop stopped
+        # skipping ahead. Nothing may touch the flash until it is done.
+        self._flash_wait_for_completion()
 
 
     def read_flash(self, length, offset=0):
