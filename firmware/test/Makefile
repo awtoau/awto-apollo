@@ -12,7 +12,7 @@ SRC_DIR := ../src
 CFLAGS  := -std=c11 -Wall -Wextra -Werror -I$(SRC_DIR)
 
 BUILD   := _build
-TESTS   := test_apollo_mode
+TESTS   := test_apollo_mode test_fpga_adv_wd
 
 .PHONY: all clean
 all: $(addprefix run-,$(TESTS))
@@ -20,6 +20,10 @@ all: $(addprefix run-,$(TESTS))
 # apollo_mode test: link the real apollo_mode.c against the test driver.
 $(BUILD)/test_apollo_mode: test_apollo_mode.c $(SRC_DIR)/apollo_mode.c | $(BUILD)
 	$(CC) $(CFLAGS) $^ -o $@
+
+# fpga_adv_wd test: header-only logic, the same file the firmware includes.
+$(BUILD)/test_fpga_adv_wd: test_fpga_adv_wd.c $(SRC_DIR)/fpga_adv_wd.h | $(BUILD)
+	$(CC) $(CFLAGS) test_fpga_adv_wd.c -o $@
 
 run-%: $(BUILD)/%
 	@echo "=== running $* ==="
