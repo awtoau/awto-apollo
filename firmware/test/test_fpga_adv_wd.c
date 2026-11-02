@@ -167,8 +167,9 @@ static int collisions(uint32_t phase_us, bool use_skip)
 			continue;
 		next_ms = ms + 10;
 		// Poll occupies [t, t + EXCHANGE); frame occupies [end - 174, end).
-		uint32_t to_end = (100000UL - since) % 100000UL;
-		if (to_end < EXCHANGE_US + FRAME_US) hits++;
+		uint32_t to_end = 100000UL - since;   // 100 ms at since == 0
+		// Before the first frame is heard nothing can be predicted.
+		if (last_end_ms && to_end < EXCHANGE_US + FRAME_US) hits++;
 	}
 	return hits;
 }

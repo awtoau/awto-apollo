@@ -398,19 +398,13 @@ static bool handle_fpga_adv_mode(uint8_t rhport, tusb_control_request_t const* r
 	// high byte the expected response length. Folded into this request rather
 	// than given its own opcode -- same subsystem, and one dispatch case is
 	// cheaper than a second handler.
-	// wValue 0xFFFC reports link health: [ok, crc_fail, timeout], each
-	// saturating at 255 and cleared by this read. Without it a corrupted
-	// response is indistinguishable from a good one at the host.
+	// wValue 0xFFFC reports link health: [ok, crc_fail, timeout, watchdog],
+	// the counts saturating at 255 and cleared by this read; watchdog is a
+	// level (bit 0 link dead, bit 1 CPU dead).
 	if (request->wValue == 0xFFFC) {
-		static uint8_t stats[3];
-		fpga_adv_get_stats(&stats[0], &stats[1], &stats[2]);
+		static uint8_t stats[4];
+		fpga_adv_get_stats(stats);
 		return tud_control_xfer(rhport, request, stats, sizeof(stats));
-	}
-
-	// wValue 0xFFFD toggles the diagnostic square wave: wIndex 1 on, 0 off.
-	if (request->wValue == 0xFFFD) {
-		fpga_adv_set_toggle(request->wIndex != 0);
-		return tud_control_xfer(rhport, request, NULL, 0);
 	}
 
 	if (request->wValue == 0xFFFE) {

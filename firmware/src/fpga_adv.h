@@ -78,10 +78,11 @@ uint8_t fpga_adv_command(uint8_t command, uint8_t *buffer, uint8_t length);
 uint8_t fpga_adv_crc8(const uint8_t *data, uint8_t length);
 
 /**
- * Report link health since the last call: responses OK, CRC failures, and
- * timeouts. Reading clears the counters.
+ * Report link health: [ok, crc_fail, timeout, watchdog health]. The first three
+ * are counts since the last call (reading clears them); health is a level,
+ * bit 0 link dead, bit 1 CPU dead (fpga_adv_wd.h).
  */
-void fpga_adv_get_stats(uint8_t *ok, uint8_t *crc_fail, uint8_t *timeout);
+void fpga_adv_get_stats(uint8_t out[4]);
 
 /**
  * True once the FPGA has completed configuration (its DONE pin is high).
@@ -90,14 +91,6 @@ void fpga_adv_get_stats(uint8_t *ok, uint8_t *crc_fail, uint8_t *timeout);
  * until configuration completes, so FPGA_ADV floats and there is no responder.
  */
 bool fpga_configuration_done(void);
-
-/**
- * Diagnostic: drive FPGA_ADV as a 10 Hz square wave, bypassing UART framing.
- *
- * Isolates "can Apollo drive this pin at all" from "does the transmit path
- * work". Off by default.
- */
-void fpga_adv_set_toggle(bool enable);
 
 /**
  * Task for things related with the advertisement pin

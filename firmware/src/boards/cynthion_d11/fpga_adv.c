@@ -9,6 +9,7 @@
 
 #include <stdbool.h>
 #include "fpga_adv.h"
+#include "fpga_adv_wd.h"
 #include "usb_switch.h"
 #include "apollo_board.h"
 #include <hal/include/hal_gpio.h>
@@ -86,11 +87,6 @@ static volatile uint32_t last_heartbeat = 0;
 // tx_frame holds start bit + 8 data + stop, shifted out LSB first.
 // tx_bits_left doubles as the "transmitting" flag: zero means idle.
 //
-// Diagnostic square-wave state; see fpga_adv_set_toggle().
-static bool     toggle_enabled = false;
-static bool     toggle_level   = false;
-static uint32_t toggle_last    = 0;
-
 static volatile uint16_t tx_frame     = 0;
 static volatile uint8_t  tx_bits_left = 0;
 
@@ -151,6 +147,10 @@ static volatile uint8_t  response_want = 0;
 static uint8_t stat_ok      = 0;   // responses that arrived with a valid CRC
 static uint8_t stat_crc     = 0;   // arrived complete, CRC did not match
 static uint8_t stat_timeout = 0;   // did not arrive at all
+
+// Watchdog: PING poll results (fpga_adv_wd.h) and when the next poll is due.
+static fpga_adv_wd_t wd;
+static uint32_t wd_next = 0;
 
 #endif
 
@@ -330,11 +330,6 @@ bool fpga_adv_set_mode(fpga_adv_mode_t mode)
 	// about to be re-muxed nothing would ever release it.
 	FPGA_ADV_RELEASE();
 
-	// Any diagnostic square wave also stops here, for the same reason -- it
-	// drives the same pin from the task loop and would fight whichever
-	// peripheral this mode selects.
-	toggle_enabled = false;
-
 	// Discard whatever the outgoing mode observed. Without this a switch could
 	// report a port request derived from the other mechanism -- e.g. edges
 	// counted from UART traffic, which is not an advertisement at all.
@@ -434,20 +429,10 @@ uint8_t fpga_adv_command(uint8_t command, uint8_t *buffer, uint8_t length)
 		return 0;
 	}
 
-	if (adv_mode != FPGA_ADV_MODE_UART || length > ADV_RESPONSE_MAX) {
-		return 0;
-	}
-
-	// Refuse while the diagnostic square wave is running.
-	//
-	// The toggle owns PA09 from the task loop and knows nothing about the
-	// transmit path. With both live, fpga_adv_task() re-muxes and re-levels the
-	// pin every 50 ms underneath a frame TC1_Handler is shifting out, and the
-	// pin's direction depends on which ran last. Returning 0 makes that
-	// combination a refusal rather than a corrupted frame -- the host asked for
-	// two mutually exclusive things and gets told, instead of getting garbage
-	// that looks like a link fault.
-	if (toggle_enabled) {
+	// response_want != 0: a command is in flight and its tud_task() dispatched
+	// another (host 0xFFFE inside a poll).
+	if (adv_mode != FPGA_ADV_MODE_UART || length > ADV_RESPONSE_MAX
+	    || response_want != 0) {
 		return 0;
 	}
 
@@ -492,23 +477,10 @@ uint8_t fpga_adv_command(uint8_t command, uint8_t *buffer, uint8_t length)
 	response_want = length;
 	fpga_adv_tx_byte(command);
 
-	// The one timeout in the protocol. It does not guard a state machine --
-	// the FPGA is stateless between commands -- it guards against the FPGA not
-	// being there at all: unconfigured, wedged, or running gateware without
-	// this protocol. No framing can fix that.
-	//
-	// Derived from the baud rate rather than hard-coded, so it stays correct
-	// if the rate changes. Ten character times per expected byte, plus a
-	// fixed allowance for the FPGA to turn the line around.
-	//
-	// Per-byte cost is folded to a compile-time constant (rounded up, so the
-	// deadline is never short) rather than dividing at runtime. `length` is a
-	// variable, so a runtime `/ ADV_UART_BAUD` would pull in __udivsi3 -- 266
-	// bytes of soft-division helper on this Cortex-M0+, for one division.
-	#define ADV_MS_PER_BYTE (((10UL * 10UL * 1000UL) + ADV_UART_BAUD - 1) \
-	                         / ADV_UART_BAUD)
-	const uint32_t deadline = board_millis()
-	                        + 1 + (uint32_t)(length + 2) * ADV_MS_PER_BYTE;
+	// The one timeout: the FPGA may not be there (unconfigured, wedged, other
+	// gateware). Longest reply (18 B) is 0.95 ms on the wire; board_millis() is
+	// 1 ms, so +3 waits 2..3 ms. Section 14 of docs/chips/cynone-sideband.md.
+	const uint32_t deadline = board_millis() + 3;
 
 	// Pump the USB stack while waiting.
 	//
@@ -574,18 +546,20 @@ uint8_t fpga_adv_crc8(const uint8_t *data, uint8_t length)
 }
 
 /**
- * Report link health: responses OK, CRC failures, timeouts.
+ * Report link health: responses OK, CRC failures, timeouts, then the watchdog
+ * health byte (fpga_adv_wd.h; a level, not cleared).
  *
  * Counters saturate at 255 and are cleared by reading, so successive reads
  * give the count since the last look rather than an ever-growing total.
  */
-void fpga_adv_get_stats(uint8_t *ok, uint8_t *crc_fail, uint8_t *timeout)
+void fpga_adv_get_stats(uint8_t out[4])
 {
 #ifdef BOARD_HAS_USB_SWITCH
-	*ok = stat_ok; *crc_fail = stat_crc; *timeout = stat_timeout;
+	out[0] = stat_ok; out[1] = stat_crc; out[2] = stat_timeout;
+	out[3] = fpga_adv_wd_health(&wd);
 	stat_ok = stat_crc = stat_timeout = 0;
 #else
-	*ok = *crc_fail = *timeout = 0;
+	out[0] = out[1] = out[2] = out[3] = 0;
 #endif
 }
 
@@ -609,41 +583,6 @@ bool fpga_configuration_done(void)
 }
 
 /**
- * Diagnostic: drive FPGA_ADV as a raw square wave.
- *
- * Bypasses the UART framing entirely -- no TC1, no shift register, just a GPIO
- * toggled from the main loop. If the FPGA sees edges from this but not from
- * fpga_adv_tx_byte(), the fault is in the transmit path rather than in the pin
- * configuration or the wire.
- *
- * Enabled by fpga_adv_set_toggle(); disabled by default so it cannot interfere
- * with normal operation.
- */
-void fpga_adv_set_toggle(bool enable)
-{
-#ifdef BOARD_HAS_USB_SWITCH
-	toggle_enabled = enable;
-	if (enable) {
-		// Take the pin off the SERCOM and drive it directly -- open-drain, for
-		// the same reason as the transmit path: a diagnostic must not be able to
-		// short the FPGA's driver. Pull-up and a parked-low OUT, then DIR
-		// toggles in fpga_adv_task().
-		gpio_set_pin_function(FPGA_ADV, GPIO_PIN_FUNCTION_OFF);
-		gpio_set_pin_direction(FPGA_ADV, GPIO_DIRECTION_IN);
-		gpio_set_pin_pull_mode(FPGA_ADV, GPIO_PULL_UP);
-		PORT->Group[FPGA_ADV_PORT].OUTCLR.reg = FPGA_ADV_PIN_MASK;
-		FPGA_ADV_RELEASE();
-	} else {
-		gpio_set_pin_direction(FPGA_ADV, GPIO_DIRECTION_IN);
-		gpio_set_pin_pull_mode(FPGA_ADV, GPIO_PULL_UP);
-		gpio_set_pin_function(FPGA_ADV, MUX_PA09C_SERCOM1_PAD3);
-	}
-#else
-	(void)enable;
-#endif
-}
-
-/**
  * The advertisement mode currently in effect.
  */
 fpga_adv_mode_t fpga_adv_get_mode(void)
@@ -661,22 +600,15 @@ fpga_adv_mode_t fpga_adv_get_mode(void)
 void fpga_adv_task(void)
 {
 #ifdef BOARD_HAS_USB_SWITCH
-	// Diagnostic square wave: 10 Hz, so 50 ms per half period. Checked before
-	// the mode logic because it deliberately overrides normal operation.
-	if (toggle_enabled) {
-		if (board_millis() - toggle_last >= 50) {
-			toggle_last  = board_millis();
-			toggle_level = !toggle_level;
-			// Open-drain, matching the transmit path: release for high, pull for
-			// low. The rising edge is the pull-ups rather than a driver, which is
-			// still plainly visible on a scope at 10 Hz.
-			if (toggle_level) {
-				FPGA_ADV_RELEASE();
-			} else {
-				FPGA_ADV_PULL_LOW();
-			}
-		}
-		return;
+	// Watchdog poll (section 14). Skipped near the predicted advertiser frame.
+	uint32_t now = board_millis();
+	if (adv_mode == FPGA_ADV_MODE_UART && (int32_t)(now - wd_next) >= 0
+	    && !fpga_adv_wd_skip(now - last_heartbeat)) {
+		uint8_t r[4];
+		wd_next = now + fpga_adv_wd_period_ms(&wd);
+		bool ok = fpga_adv_command(0x01, r, 4) == 4
+		       && fpga_adv_crc8(r, 3) == r[3] && (r[0] & 1);
+		fpga_adv_wd_update(&wd, ok, r[2]);
 	}
 
 	if (adv_mode == FPGA_ADV_MODE_EIC) {
@@ -700,7 +632,7 @@ void fpga_adv_task(void)
 	// complete frame and fpga_requesting_port() compares against that directly.
 
     // Take over USB if the FPGA is not requesting the port.
-	if (fpga_requesting_port() == false) {
+	if (fpga_requesting_port() == false || fpga_adv_wd_health(&wd)) {
 		take_over_usb();
 	} else if (fpga_usb_allowed) {
 		hand_off_usb();
