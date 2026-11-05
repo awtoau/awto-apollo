@@ -75,7 +75,7 @@ uint8_t fpga_adv_command(uint8_t command, uint8_t *buffer, uint8_t length);
 /**
  * CRC-8/ATM over a buffer, matching the responder gateware.
  */
-uint8_t fpga_adv_crc8(const uint8_t *data, uint8_t length);
+#include "fpga_adv_crc.h"  // fpga_adv_crc8()
 
 /**
  * Report link health: [ok, crc_fail, timeout, watchdog health]. The first three

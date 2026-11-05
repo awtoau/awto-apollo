@@ -83,6 +83,10 @@ CFLAGS += \
 # default balanced partitioning GCC cannot inline across partition boundaries,
 # which on a program this small costs most of the benefit.
 CFLAGS  += -flto=auto -flto-partition=one
+
+# GCC 15 turns a bit-serial CRC loop into a 256-byte lookup table (`-foptimize-crc`).
+# Off: the loop is smaller on a part with no flash to spare (#607).
+CFLAGS  += -fno-optimize-crc
 # Stack reservation, from measurement rather than convention.
 #
 # The default is 0x400 (1024 bytes) and was never measured. stack_probe.c paints

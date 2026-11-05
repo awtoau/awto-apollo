@@ -12,7 +12,7 @@ SRC_DIR := ../src
 CFLAGS  := -std=c11 -Wall -Wextra -Werror -I$(SRC_DIR)
 
 BUILD   := _build
-TESTS   := test_apollo_mode test_fpga_adv_wd test_hang_wd test_jtag_tail test_jtag_scan_tail
+TESTS   := test_apollo_mode test_fpga_adv_crc test_fpga_adv_wd test_hang_wd test_jtag_tail test_jtag_scan_tail
 
 .PHONY: all clean
 all: $(addprefix run-,$(TESTS))
@@ -24,6 +24,10 @@ $(BUILD)/test_apollo_mode: test_apollo_mode.c $(SRC_DIR)/apollo_mode.c | $(BUILD
 # fpga_adv_wd test: header-only logic, the same file the firmware includes.
 $(BUILD)/test_fpga_adv_wd: test_fpga_adv_wd.c $(SRC_DIR)/fpga_adv_wd.h | $(BUILD)
 	$(CC) $(CFLAGS) test_fpga_adv_wd.c -o $@
+
+# fpga_adv_crc test: header-only, the same file the firmware includes.
+$(BUILD)/test_fpga_adv_crc: test_fpga_adv_crc.c $(SRC_DIR)/fpga_adv_crc.h | $(BUILD)
+	$(CC) $(CFLAGS) test_fpga_adv_crc.c -o $@
 
 # hang_wd test: header-only logic, the same file the firmware includes.
 $(BUILD)/test_hang_wd: test_hang_wd.c $(SRC_DIR)/hang_wd.h | $(BUILD)

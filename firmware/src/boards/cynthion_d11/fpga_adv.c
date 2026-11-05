@@ -526,26 +526,6 @@ uint8_t fpga_adv_command(uint8_t command, uint8_t *buffer, uint8_t length)
 }
 
 /**
- * CRC-8/ATM over a buffer: polynomial 0x07, init 0x00, no reflection.
- *
- * Matches the responder gateware. Bitwise rather than table-driven: a 256-byte
- * table would cost more flash than this saves in cycles, on a link that moves
- * 18 bytes at a time.
- */
-uint8_t fpga_adv_crc8(const uint8_t *data, uint8_t length)
-{
-	uint8_t crc = 0;
-	for (uint8_t i = 0; i < length; i++) {
-		crc ^= data[i];
-		for (uint8_t bit = 0; bit < 8; bit++) {
-			crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x07)
-			                   : (uint8_t)(crc << 1);
-		}
-	}
-	return crc;
-}
-
-/**
  * Report link health: responses OK, CRC failures, timeouts, then the watchdog
  * health byte (fpga_adv_wd.h; a level, not cleared).
  *
