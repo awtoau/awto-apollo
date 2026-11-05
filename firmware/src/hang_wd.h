@@ -17,12 +17,12 @@
 // (fpga_adv.c). Not measured on a board.
 #define HANG_WD_LONGEST_STALL_MS 100u
 
-// WDT_CONFIG_PER_512 at the 1.024 kHz WDT clock (OSCULP32K / 32, the reset default that dfu.c also
-// relies on): 500 ms, 5x the longest stall above. On expiry the MCU resets and Apollo re-enumerates.
+// WDT_CONFIG_PER_16K at the 32.768 kHz WDT clock (the reset default that dfu.c also relies on): 500 ms,
+// 5x the longest stall above. On expiry the MCU resets and Apollo re-enumerates.
 #define HANG_WD_TIMEOUT_MS 500u
 
 // The kick is the main loop's 20 ms housekeeping block. A WDT CLEAR is write-synchronised to the
-// 1 kHz clock, so kicking every loop pass would stall the bus behind it; 20 ms spacing never does.
+// WDT clock, so kicking every loop pass could stall the bus behind it; 20 ms spacing does not.
 #define HANG_WD_KICK_PERIOD_MS 20u
 
 _Static_assert(HANG_WD_TIMEOUT_MS >= 5 * HANG_WD_LONGEST_STALL_MS, "timeout must clear the longest stall 5x");

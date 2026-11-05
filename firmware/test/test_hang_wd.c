@@ -25,7 +25,6 @@ int main(void)
 	      HANG_WD_TIMEOUT_MS, HANG_WD_LONGEST_STALL_MS);
 	CHECK(HANG_WD_TIMEOUT_MS >= 10 * HANG_WD_KICK_PERIOD_MS, "at least ten kicks (%u ms apart) fit in the timeout",
 	      HANG_WD_KICK_PERIOD_MS);
-	CHECK(HANG_WD_KICK_PERIOD_MS >= 3, "kicks are spaced past the ~3 ms WDT clear synchronisation");
 
 	printf(failures ? "FAILED\n" : "all passed\n");
 	return failures != 0;

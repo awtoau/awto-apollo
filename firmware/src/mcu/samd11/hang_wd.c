@@ -9,8 +9,8 @@
 
 void hang_wd_enable(void)
 {
-	// GCLK_WDT is on generator 2 (OSCULP32K / 32 = 1.024 kHz) out of reset, as dfu.c relies on.
-	WDT->CONFIG.reg = WDT_CONFIG_PER_512;
+	// GCLK_WDT runs at 32.768 kHz out of reset (as dfu.c relies on): 16384 clocks = 500 ms.
+	WDT->CONFIG.reg = WDT_CONFIG_PER_16K;
 	WDT->CTRL.reg = WDT_CTRL_ENABLE;
 }
 
