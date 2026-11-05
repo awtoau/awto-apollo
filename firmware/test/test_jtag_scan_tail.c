@@ -58,10 +58,12 @@ void spi_release_pinmux(spi_target_t target) { (void)target; }
 void spi_init(spi_target_t target, bool lsb_first, bool configure_pinmux, uint8_t baud_divider,
               uint8_t clock_polarity, uint8_t clock_phase)
 { (void)target; (void)lsb_first; (void)configure_pinmux; (void)baud_divider; (void)clock_polarity; (void)clock_phase; }
+static uint8_t *spi_rx;
+static size_t spi_rx_len;
 void spi_send(spi_target_t port, void *data_to_send, void *data_received, size_t length)
-{ (void)port; (void)data_to_send; (void)data_received; (void)length; }
+{ (void)port; (void)data_to_send; spi_rx = data_received; spi_rx_len = length; }
 bool spi_send_async(spi_target_t port, void *data_to_send, void *data_received, size_t length)
-{ (void)port; (void)data_to_send; (void)data_received; (void)length; return true; }
+{ (void)port; (void)data_to_send; spi_rx = data_received; spi_rx_len = length; return true; }
 bool spi_send_done(void) { return true; }
 bool tud_control_xfer(uint8_t rhport, tusb_control_request_t const *request, void *buffer, uint16_t len)
 { (void)rhport; (void)request; (void)buffer; (void)len; return true; }
@@ -108,6 +110,36 @@ int main(void)
 	tap_calls = 0; tap_output = (uint8_t *)1;
 	(void)jtag_scan_from(comms.jtag_tx, 692 * 8, true, false, true);
 	CHECK(tap_calls == 1 && tap_output == NULL, "a 692-byte discarding final chunk has no tail destination");
+
+	// Every bit count, every flag combination: neither the DMA receive nor the tail may leave comms.
+	int bad_any = 0;
+	size_t first_bits = 0;
+	for (int capture = 0; capture <= 1; capture++) {
+		for (int advance = 0; advance <= 1; advance++) {
+			for (uint32_t bits = 1; bits <= 8u * JTAG_BUFFER_SIZE + 64u; bits++) {
+				tap_calls = 0; tap_output = NULL; spi_rx = NULL; spi_rx_len = 0;
+				if (!jtag_scan_from(comms.jtag_tx, bits, advance, false, !capture)) continue;
+				bool rx_bad = spi_rx && (spi_rx < comms.jtag_tx || spi_rx + spi_rx_len > comms.jtag_tx + sizeof(comms));
+				bool tail_bad = tap_calls && tap_output && !inside_comms(tap_output, tap_bits);
+				if (rx_bad || tail_bad) {
+					if (!bad_any) first_bits = bits;
+					bad_any++;
+				}
+			}
+		}
+	}
+	CHECK(bad_any == 0, "no scan of any bit count (capture or discard, advance or not) writes outside comms (%d do; first at %zu bits)",
+	      bad_any, first_bits);
+
+	// The benchmark (0xB9) receives into jtag_in_buffer: its chunk must fit the read half.
+	int bad_bench = 0;
+	for (unsigned units = 1; units <= 255; units++) {
+		tusb_control_request_t request = { .bRequest = 0xB9, .wValue = 1, .wIndex = (uint16_t)(units | 0xFF00), .wLength = 12 };
+		spi_rx = NULL; spi_rx_len = 0;
+		(void)handle_jtag_benchmark(0, &request);
+		if (spi_rx && (spi_rx < comms.jtag_tx || spi_rx + spi_rx_len > comms.jtag_tx + sizeof(comms))) bad_bench++;
+	}
+	CHECK(bad_bench == 0, "no benchmark chunk receives outside comms (%d chunk sizes do)", bad_bench);
 
 	printf(failures ? "FAILED\n" : "all passed\n");
 	return failures != 0;
