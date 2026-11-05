@@ -24,83 +24,12 @@
 #include "fpga_adv.h"
 #include "stack_probe.h"
 #include "board_rev.h"
+#include "vendor_requests.h"
 
 #define USB_API_MAJOR 1
 #define USB_API_MINOR 2
 
 
-// Supported vendor requests.
-enum {
-	VENDOR_REQUEST_GET_ID                  = 0xa0,
-	// 0xa1 was SET_LED_PATTERN, removed -- do not reuse (see led.c).
-	VENDOR_REQUEST_GET_FIRMWARE_VERSION    = 0xa2,
-	VENDOR_REQUEST_GET_USB_API_VERSION     = 0xa3,
-	VENDOR_REQUEST_GET_ADC_READING         = 0xa4,
-
-	// Stack high-water mark, for right-sizing the reservation (#74). Grouped
-	// with the other read-only status requests rather than given a number of its
-	// own elsewhere; 0xa5 was the next free one.
-	VENDOR_REQUEST_GET_STACK_USAGE         = 0xa5,
-
-	//
-	// JTAG requests.
-	//
-	VENDOR_REQUEST_JTAG_START              = 0xbf,
-	VENDOR_REQUEST_JTAG_STOP               = 0xbe,
-
-	VENDOR_REQUEST_JTAG_CLEAR_OUT_BUFFER   = 0xb0,
-	VENDOR_REQUEST_JTAG_SET_OUT_BUFFER     = 0xb1,
-	VENDOR_REQUEST_JTAG_GET_IN_BUFFER      = 0xb2,
-	VENDOR_REQUEST_JTAG_SCAN               = 0xb3,
-	VENDOR_REQUEST_JTAG_RUN_CLOCK          = 0xb4,
-	VENDOR_REQUEST_JTAG_GOTO_STATE         = 0xb5,
-	VENDOR_REQUEST_JTAG_GET_STATE          = 0xb6,
-	// Reserved upstream for a bulk JTAG scan that was never implemented: there is
-	// no handler and no case in the dispatch switch, here or in stock v1.1.1.
-	//
-	// Do NOT add it to is_jtag_request() or is_jtag_programming_request(). It was
-	// in both until this comment replaced them, which armed an upstream
-	// placeholder: 0xb7 escalated the session to "programming in flight" and then
-	// fell through to `return false`, leaving the JTAG lock held by a request
-	// that cannot complete. Gating a request that cannot be dispatched has no
-	// meaning. Kept as a constant so the ID is not silently reused.
-	VENDOR_REQUEST_JTAG_BULK_SCAN          = 0xb7,
-	VENDOR_REQUEST_JTAG_GET_INFO           = 0xb8,
-	VENDOR_REQUEST_JTAG_BENCHMARK          = 0xb9,
-
-	// General programming requests.
-	VENDOR_REQUEST_TRIGGER_RECONFIGURATION = 0xc0,
-	VENDOR_REQUEST_FORCE_FPGA_OFFLINE      = 0xc1,
-	VENDOR_REQUEST_ALLOW_FPGA_TAKEOVER_USB = 0xc2,
-	VENDOR_REQUEST_FPGA_ADV_MODE           = 0xc3,
-	VENDOR_REQUEST_GET_FPGA_STATUS_PINS    = 0xc4,
-	VENDOR_REQUEST_BOOT_TO_DFU             = 0xed,
-
-
-	//
-	// Debug SPI requests
-	//
-	VENDOR_REQUEST_DEBUG_SPI_SEND          = 0x50,
-	VENDOR_REQUEST_DEBUG_SPI_READ_RESPONSE = 0x51,
-	VENDOR_REQUEST_FLASH_SPI_SEND          = 0x52,
-	VENDOR_REQUEST_TAKE_FLASH_LINES        = 0x53,
-	VENDOR_REQUEST_RELEASE_FLASH_LINES     = 0x54,
-
-	//
-	// Self-test requests.
-	//
-	VENDOR_REQUEST_GET_RAIL_VOLTAGE        = 0xe0,
-
-	//
-	// Control-plane escape hatch.
-	//
-	VENDOR_REQUEST_EMERGENCY_RESET         = 0xec,
-
-	//
-	// Microsoft WCID descriptor request
-	//
-	VENDOR_REQUEST_GET_MS_DESCRIPTOR       = 0xee,
-};
 
 // Microsoft OS 1.0 Compat ID Feature descriptor
 const uint8_t msft_10_compat_id[] = {
@@ -477,24 +406,6 @@ static bool is_jtag_request(uint8_t request)
 }
 
 
-/**
- * JTAG requests that actually drive the scan chain. The first of these in a
- * session escalates it to "programming in flight", after which conflicting
- * control-plane requests are refused.
- */
-static bool is_jtag_programming_request(uint8_t request)
-{
-	switch (request) {
-		case VENDOR_REQUEST_JTAG_SET_OUT_BUFFER:
-		case VENDOR_REQUEST_JTAG_SCAN:
-		case VENDOR_REQUEST_JTAG_RUN_CLOCK:
-		case VENDOR_REQUEST_JTAG_GOTO_STATE:
-		case VENDOR_REQUEST_JTAG_BENCHMARK:
-			return true;
-		default:
-			return false;
-	}
-}
 
 
 /**
@@ -572,7 +483,11 @@ static bool handle_vendor_request_setup(uint8_t rhport, tusb_control_request_t c
 
 	// The first programming-class request in an open session escalates it, so
 	// the gate above applies for the remainder of the session.
-	if (is_jtag_programming_request(request->bRequest)) {
+	int gate = jtag_request_gate(apollo_mode_jtag_active(), request->bRequest);
+	if (gate == JTAG_GATE_REFUSE) {
+		return false;
+	}
+	if (gate == JTAG_GATE_ESCALATE) {
 		apollo_mode_enter_programming();
 	}
 

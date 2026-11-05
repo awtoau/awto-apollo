@@ -15,6 +15,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include "vendor_requests.h"
 
 #ifndef JTAG_SRC
 #define JTAG_SRC "../src/jtag.c"
@@ -144,6 +145,39 @@ int main(void)
 	}
 	CHECK(bad_bits == 0, "a bitbang scan shifts every bit it was asked for (%d counts truncated; first at %u bits)",
 	      bad_bits, first_bitbang);
+
+	// No JTAG_START: no request that writes the scan buffers (the live console ring) may run.
+	{
+		const uint8_t writers[] = { VENDOR_REQUEST_JTAG_CLEAR_OUT_BUFFER, VENDOR_REQUEST_JTAG_SET_OUT_BUFFER,
+		                            VENDOR_REQUEST_JTAG_SCAN, VENDOR_REQUEST_JTAG_RUN_CLOCK,
+		                            VENDOR_REQUEST_JTAG_GOTO_STATE, VENDOR_REQUEST_JTAG_BENCHMARK };
+		int leaked = 0, blocked_in_session = 0;
+		for (unsigned i = 0; i < sizeof(writers); i++) {
+			if (jtag_request_gate(false, writers[i]) != JTAG_GATE_REFUSE) leaked++;
+			if (jtag_request_gate(true, writers[i]) != JTAG_GATE_ESCALATE) blocked_in_session++;
+		}
+		CHECK(leaked == 0, "no scan-buffer request is allowed without a session (%d are)", leaked);
+		CHECK(blocked_in_session == 0, "all of them run and escalate inside a session (%d do not)", blocked_in_session);
+		CHECK(jtag_request_gate(false, VENDOR_REQUEST_JTAG_START) == JTAG_GATE_PASS, "JTAG_START is allowed without a session");
+		CHECK(jtag_request_gate(false, VENDOR_REQUEST_GET_ID) == JTAG_GATE_PASS, "GET_ID is allowed without a session");
+	}
+
+	// The benchmark's wire time (48 MHz / (2 * (divider + 1))) stays inside half the watchdog stall budget.
+	int bad_wire = 0, accepted = 0;
+	for (unsigned units = 1; units <= 8; units++) {
+		for (unsigned repeats = 1; repeats <= 1024; repeats *= 2) {
+			for (unsigned divider = 0; divider <= 0xFF; divider++) {
+				tusb_control_request_t request = { .bRequest = 0xB9, .wValue = (uint16_t)repeats,
+				                                   .wIndex = (uint16_t)(units | (divider << 8)), .wLength = 12 };
+				if (!handle_jtag_benchmark(0, &request)) continue;
+				accepted++;
+				double div = divider == 0xFF ? 1 : divider;
+				double wire_ms = units * 64.0 * repeats * 16.0 * (div + 1) / 48000.0;
+				if (wire_ms > HANG_WD_LONGEST_STALL_MS / 2.0) bad_wire++;
+			}
+		}
+	}
+	CHECK(accepted > 0 && bad_wire == 0, "no accepted benchmark outruns the watchdog (%d of %d do)", bad_wire, accepted);
 
 	// The benchmark (0xB9) receives into jtag_in_buffer: its chunk must fit the read half.
 	int bad_bench = 0;

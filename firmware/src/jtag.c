@@ -23,9 +23,13 @@
 #include "uart.h"
 #include "spi.h"
 #include "fpga.h"
+#include "hang_wd.h"
 
 #define ISC_ENABLE  0xC6
 #define ISC_DISABLE 0x26
+
+// Half the watchdog's stall budget; the other half is for the readback loop.
+#define JTAG_BENCHMARK_MAX_WIRE_UNITS (HANG_WD_LONGEST_STALL_MS * 1000u / 2u * 3u)
 
 
 // JTAG comms buffers, sharing storage with the console RX ring.
@@ -825,14 +829,12 @@ bool handle_jtag_benchmark(uint8_t rhport, tusb_control_request_t const* request
 		return false;
 	}
 
-	// Bound the total work, so a large repeats cannot exceed the host's
-	// control-transfer timeout the way the truncation bug did. At 12 MHz SCK,
-	// 65536 bytes is about 44 ms of clocking -- comfortably inside a 500 ms
-	// timeout, and far more than any single measurement needs.
-	if ((uint32_t)chunk * repeats > 65536u) {
-		return false;
-	}
-	if (repeats == 0) {
+	// Bound the work: repeats <= 1024 keeps the product below inside 32 bits, and the
+	// wire time (bytes * 16 * (divider + 1) / 48 us at SCK = 48 MHz / (2 * (divider + 1)),
+	// 0xFF keeping the default divider of 1) stays inside half the watchdog's stall budget.
+	// A run past it would reset the part (hang_wd.h) or outlast the host's transfer timeout.
+	if (repeats == 0 || repeats > 1024 ||
+	    (uint32_t)chunk * repeats * ((divider == 0xFF ? 1u : divider) + 1u) > JTAG_BENCHMARK_MAX_WIRE_UNITS) {
 		return false;
 	}
 
