@@ -224,8 +224,8 @@ bool jtag_scan(uint32_t num_bits, bool advance_state, bool bitbang,
 static struct {
 	// Where the tail's received bit go (jtag_tail.h): NULL when the scan discards TDO.
 	uint8_t       *slow_dest;
-	// At most 8 bits, so one byte.
-	uint8_t        slow_bits;
+	// 8 bits, or the whole scan under FORCE_BITBANG (up to 8 * JTAG_BUFFER_SIZE).
+	uint16_t       slow_bits;
 	bool           advance_state;
 	// Where the leftover bits come from: the byte just past the DMA'd block, in
 	// whichever of the two transmit buffers this scan came from. Stored already-offset

@@ -131,6 +131,20 @@ int main(void)
 	CHECK(bad_any == 0, "no scan of any bit count (capture or discard, advance or not) writes outside comms (%d do; first at %zu bits)",
 	      bad_any, first_bits);
 
+	// FORCE_BITBANG sends every bit through the tail: the tail must be told the full count.
+	int bad_bits = 0;
+	uint32_t first_bitbang = 0;
+	for (uint32_t bits = 1; bits <= 8u * JTAG_READ_BUFFER_SIZE; bits++) {
+		tap_calls = 0; tap_bits = 0;
+		if (!jtag_scan_from(comms.jtag_tx, bits, false, true, true)) continue;
+		if (tap_bits != bits) {
+			if (!bad_bits) first_bitbang = bits;
+			bad_bits++;
+		}
+	}
+	CHECK(bad_bits == 0, "a bitbang scan shifts every bit it was asked for (%d counts truncated; first at %u bits)",
+	      bad_bits, first_bitbang);
+
 	// The benchmark (0xB9) receives into jtag_in_buffer: its chunk must fit the read half.
 	int bad_bench = 0;
 	for (unsigned units = 1; units <= 255; units++) {
