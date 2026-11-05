@@ -42,6 +42,7 @@
 #include "usb_switch.h"
 #include "button.h"
 #include "fpga_adv.h"
+#include "hang_wd.h"
 
 
 
@@ -59,6 +60,7 @@
 #define HOUSEKEEPING_PERIOD_MS 20u
 
 static uint32_t next_housekeeping_ms = 0;
+_Static_assert(HOUSEKEEPING_PERIOD_MS == HANG_WD_KICK_PERIOD_MS, "the watchdog kick rides on housekeeping");
 
 
 /**
@@ -70,6 +72,7 @@ int main(void)
 	// excluded from the measurement. See stack_probe.c.
 	stack_probe_paint();
 
+	hang_wd_enable();
 	board_init();
 	detect_hardware_revision();
 	tusb_init();
@@ -154,6 +157,7 @@ int main(void)
 		// 32-bit millisecond counter and rolls over after ~49 days.
 		if ((int32_t)(board_millis() - next_housekeeping_ms) >= 0) {
 			next_housekeeping_ms = board_millis() + HOUSEKEEPING_PERIOD_MS;
+			hang_wd_kick();
 			led_task();
 			button_task();
 		}
