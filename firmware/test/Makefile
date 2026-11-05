@@ -12,7 +12,7 @@ SRC_DIR := ../src
 CFLAGS  := -std=c11 -Wall -Wextra -Werror -I$(SRC_DIR)
 
 BUILD   := _build
-TESTS   := test_apollo_mode test_fpga_adv_wd test_hang_wd
+TESTS   := test_apollo_mode test_fpga_adv_wd test_hang_wd test_jtag_tail
 
 .PHONY: all clean
 all: $(addprefix run-,$(TESTS))
@@ -28,6 +28,10 @@ $(BUILD)/test_fpga_adv_wd: test_fpga_adv_wd.c $(SRC_DIR)/fpga_adv_wd.h | $(BUILD
 # hang_wd test: header-only logic, the same file the firmware includes.
 $(BUILD)/test_hang_wd: test_hang_wd.c $(SRC_DIR)/hang_wd.h | $(BUILD)
 	$(CC) $(CFLAGS) test_hang_wd.c -o $@
+
+# jtag_tail test: header-only logic, the same file the firmware includes.
+$(BUILD)/test_jtag_tail: test_jtag_tail.c $(SRC_DIR)/jtag_tail.h | $(BUILD)
+	$(CC) $(CFLAGS) test_jtag_tail.c -o $@
 
 run-%: $(BUILD)/%
 	@echo "=== running $* ==="
