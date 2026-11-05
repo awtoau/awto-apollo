@@ -12,7 +12,7 @@ SRC_DIR := ../src
 CFLAGS  := -std=c11 -Wall -Wextra -Werror -I$(SRC_DIR)
 
 BUILD   := _build
-TESTS   := test_apollo_mode test_fpga_adv_wd test_hang_wd test_jtag_tail
+TESTS   := test_apollo_mode test_fpga_adv_wd test_hang_wd test_jtag_tail test_jtag_scan_tail
 
 .PHONY: all clean
 all: $(addprefix run-,$(TESTS))
@@ -32,6 +32,10 @@ $(BUILD)/test_hang_wd: test_hang_wd.c $(SRC_DIR)/hang_wd.h | $(BUILD)
 # jtag_tail test: header-only logic, the same file the firmware includes.
 $(BUILD)/test_jtag_tail: test_jtag_tail.c $(SRC_DIR)/jtag_tail.h | $(BUILD)
 	$(CC) $(CFLAGS) test_jtag_tail.c -o $@
+
+# jtag_scan_tail test: the real jtag.c against stub headers (test/stubs) and fake SPI / TAP functions.
+$(BUILD)/test_jtag_scan_tail: test_jtag_scan_tail.c $(SRC_DIR)/jtag.c $(SRC_DIR)/jtag_tail.h | $(BUILD)
+	$(CC) -std=gnu11 -Wall -Wextra -Werror -Wno-unused-function -Istubs -I$(SRC_DIR) -I$(SRC_DIR)/boards/cynthion_d11 -DJTAG_SRC='"$(CURDIR)/$(SRC_DIR)/jtag.c"' test_jtag_scan_tail.c -o $@
 
 run-%: $(BUILD)/%
 	@echo "=== running $* ==="
