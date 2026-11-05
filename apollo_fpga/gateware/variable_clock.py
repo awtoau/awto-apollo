@@ -49,7 +49,7 @@ def _find_ecppll():
     found = shutil.which("ecppll")
     if found:
         return found
-    for candidate in (Path.home() / "opt/oss-cad-suite/bin/ecppll",):
+    for candidate in (Path.home() / "opt/oss-cad-suite-20261104/oss-cad-suite/bin/ecppll",):
         if candidate.exists():
             return str(candidate)
     return "ecppll"
