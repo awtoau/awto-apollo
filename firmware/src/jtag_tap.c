@@ -262,7 +262,9 @@ void jtag_tap_shift(
 			bool tdo = jtag_pulse_clock_and_read_tdo();
 			tdo_byte |= tdo << j;
 		}
-		output_data[i] = tdo_byte;
+		if (output_data) {
+			output_data[i] = tdo_byte;
+		}
 	}
 }
 

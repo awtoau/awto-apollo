@@ -19,6 +19,7 @@
 
 #include "led.h"
 #include "jtag.h"
+#include "jtag_tail.h"
 #include "uart.h"
 #include "spi.h"
 #include "fpga.h"
@@ -221,10 +222,8 @@ bool jtag_scan(uint32_t num_bits, bool advance_state, bool bitbang,
 // returns true when nothing is outstanding, so asking it unconditionally is correct for
 // both the DMA'd and the polled-fallback case.
 static struct {
-	// How far into jtag_in_buffer the tail's received bits go -- the same value as the
-	// bulk byte count, kept as an offset because that is its only use. Bounded by
-	// JTAG_BUFFER_SIZE, so 16 bits is ample.
-	uint16_t       slow_offset;
+	// Where the tail's received bit go (jtag_tail.h): NULL when the scan discards TDO.
+	uint8_t       *slow_dest;
 	// At most 8 bits, so one byte.
 	uint8_t        slow_bits;
 	bool           advance_state;
@@ -293,7 +292,7 @@ static bool jtag_scan_start(uint8_t *out_buffer, uint32_t num_bits,
 	}
 
 	scan_tail.slow_source   = out_buffer + bytes_to_send_bulk;
-	scan_tail.slow_offset   = bytes_to_send_bulk;
+	scan_tail.slow_dest     = jtag_tail_dest(discard_tdo, jtag_in_buffer, bytes_to_send_bulk);
 	scan_tail.slow_bits     = bits_to_send_slow;
 	scan_tail.advance_state = advance_state;
 
@@ -336,7 +335,7 @@ static bool jtag_scan_finish_step(void)
 	spi_release_pinmux(SPI_FPGA_JTAG);
 	if (scan_tail.slow_bits) {
 		jtag_tap_shift(scan_tail.slow_source,
-		               jtag_in_buffer + scan_tail.slow_offset,
+		               scan_tail.slow_dest,
 		               scan_tail.slow_bits, scan_tail.advance_state);
 		// Cleared so a second finish step cannot re-shift these bits.
 		scan_tail.slow_bits = 0;
