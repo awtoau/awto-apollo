@@ -260,7 +260,8 @@ static bool jtag_scan_start(uint8_t *out_buffer, uint32_t num_bits,
 	// A scan that captures TDO is bounded by the READ buffer, since TDO lands in the
 	// second half of the region the payload occupies. Without this a large capturing
 	// scan would overwrite the data it was still clocking out.
-	if (!discard_tdo && bytes_to_send_bulk > JTAG_READ_BUFFER_SIZE) {
+	// In bits, so the tail byte counts: 4097 bits is 512 bulk bytes plus a tail byte, one past the half.
+	if (!discard_tdo && num_bits > 8u * JTAG_READ_BUFFER_SIZE) {
 		return false;
 	}
 
@@ -819,7 +820,8 @@ bool handle_jtag_benchmark(uint8_t rhport, tusb_control_request_t const* request
 	uint16_t chunk   = (uint16_t)(request->wIndex & 0xFF) * 64u;
 	uint8_t  divider = (request->wIndex >> 8) & 0xFF;
 
-	if (chunk == 0 || chunk > JTAG_BUFFER_SIZE) {
+	// The benchmark receives into jtag_in_buffer, the read half of the region.
+	if (chunk == 0 || chunk > JTAG_READ_BUFFER_SIZE) {
 		return false;
 	}
 
